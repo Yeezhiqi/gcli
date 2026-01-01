@@ -7,6 +7,12 @@ from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from log import log
+import os
+import json
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional, Dict
+import google.generativeai as genai
 
 # HTTP Bearer security scheme
 security = HTTPBearer()
@@ -71,6 +77,36 @@ BASE_MODELS = [
     "gemini-3-flash-preview"
 ]
 
+def get_all_gemini_models():
+    """
+    获取所有可用的 Gemini 模型名称。
+    """
+    available_models = []
+    for m in genai.list_models():
+        # 过滤掉不支持生成内容的模型，或者根据您的需求进行其他过滤
+        if "generateContent" in m.supported_generation_methods:
+            model_name = m.name
+            # 检查并去除 '/models/' 前缀
+            if model_name.startswith('models/'):
+                model_name = model_name.replace('models/', '', 1) # 只替换一次
+            available_models.append(model_name)
+    return available_models
+    
+# 获取模型列表
+BASE_MODELS = get_all_gemini_models()
+
+manual_models_to_add = [
+]
+# 3. 使用 extend() 方法将新列表中的所有模型添加到 BASE_MODELS
+BASE_MODELS.extend(manual_models_to_add)
+
+# 4. 为了防止重复，可以将列表转换为集合再转回列表
+BASE_MODELS = list(set(BASE_MODELS))
+
+PUBLIC_API_MODELS = [
+    "gemini-2.5-flash-image",
+    "gemini-2.5-flash-image-preview"
+]
 
 # ====================== Model Helper Functions ======================
 
