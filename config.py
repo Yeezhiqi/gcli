@@ -7,7 +7,11 @@ Centralizes all configuration to avoid duplication across modules.
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from typing import Any, Optional
+from log import log
+import random
 
 # 全局配置缓存
 _config_cache: dict[str, Any] = {}
@@ -393,3 +397,41 @@ async def get_antigravity_api_url() -> str:
             "ANTIGRAVITY_API_URL",
         )
     )
+
+# 缓存解析后的 Keys
+_google_search_api_keys = []
+
+async def get_google_search_config():
+    """
+    获取 Google Search API 配置，支持多 Key 轮换
+    环境变量格式: GOOGLE_SEARCH_API_KEY="key1,key2,key3"
+    """
+    global _google_search_api_keys
+    
+    # 1. 尝试获取环境变量
+    keys_str = os.getenv("GOOGLE_Search_API_KEY", "")
+    cx_id = os.getenv("GOOGLE_Search_CX_ID")
+    
+    # 2. 【调试关键点】如果获取不到，打印所有相关的环境变量名，看看是不是名字写错了
+    if not keys_str or not cx_id:
+        # 使用 log.error 确保能显示在红色错误日志中
+        log.error(f"[CONFIG DEBUG] 环境变量读取失败!")
+        log.error(f"[CONFIG DEBUG] 尝试读取的 KEY: '{keys_str}'")
+        log.error(f"[CONFIG DEBUG] 尝试读取的 CX: '{cx_id}'")
+        # 打印当前环境中所有以 GOOGLE 开头的变量，检查是否有拼写错误
+        google_envs = [k for k in os.environ.keys() if k.startswith("GOOGLE")]
+        log.error(f"[CONFIG DEBUG] 当前系统内存在的 GOOGLE 相关变量: {google_envs}")
+        
+    # 如果缓存为空且有配置，进行解析
+    if not _google_search_api_keys and keys_str:
+        # 按逗号分割并去除空白
+        _google_search_api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    
+    # 如果没有可用的 key，返回 None
+    if not _google_search_api_keys:
+        return None, None
+        
+    # 随机选择一个 Key
+    selected_key = random.choice(_google_search_api_keys)
+    
+    return selected_key, cx_id
