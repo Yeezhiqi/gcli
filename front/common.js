@@ -1,5 +1,5 @@
 // =====================================================================
-// GCLI2API 控制面板公共JavaScript模块
+// GCLI2API 控制面板公共JavaScript模块 (完整修复版)
 // =====================================================================
 
 // =====================================================================
@@ -77,8 +77,6 @@ function createCredsManager(type) {
 
         // DOM元素ID前缀
         getElementId: (suffix) => {
-            // 普通凭证的ID首字母小写,如 credsLoading
-            // Antigravity的ID是 antigravity + 首字母大写,如 antigravityCredsLoading
             if (isAntigravity) {
                 return 'antigravity' + suffix.charAt(0).toUpperCase() + suffix.slice(1);
             }
@@ -115,16 +113,17 @@ function createCredsManager(type) {
                                 last_success: item.last_success,
                             },
                             user_email: item.user_email,
-                            model_cooldowns: item.model_cooldowns || {}
+                            model_cooldowns: item.model_cooldowns || {},
+                            // [修复] 确保正确解析统计数据
+                            daily_usage: item.daily_usage || 0,
+                            daily_usage_pro: item.daily_usage_pro || 0
                         };
                     });
 
                     this.totalCount = data.total;
-                    // 使用后端返回的全局统计数据
                     if (data.stats) {
                         this.statsData = data.stats;
                     } else {
-                        // 兼容旧版本后端
                         this.calculateStats();
                     }
                     this.updateStatsDisplay();
@@ -147,7 +146,6 @@ function createCredsManager(type) {
             }
         },
 
-        // 计算统计数据（仅用于兼容旧版本后端）
         calculateStats() {
             this.statsData = { total: this.totalCount, normal: 0, disabled: 0 };
             Object.values(this.data).forEach(credInfo => {
@@ -159,14 +157,12 @@ function createCredsManager(type) {
             });
         },
 
-        // 更新统计显示
         updateStatsDisplay() {
             document.getElementById(this.getElementId('StatTotal')).textContent = this.statsData.total;
             document.getElementById(this.getElementId('StatNormal')).textContent = this.statsData.normal;
             document.getElementById(this.getElementId('StatDisabled')).textContent = this.statsData.disabled;
         },
 
-        // 渲染凭证列表
         renderList() {
             const list = document.getElementById(this.getElementId('CredsList'));
             list.innerHTML = '';
@@ -189,12 +185,10 @@ function createCredsManager(type) {
             this.updateBatchControls();
         },
 
-        // 获取总页数
         getTotalPages() {
             return Math.ceil(this.totalCount / this.pageSize);
         },
 
-        // 更新分页信息
         updatePagination() {
             const totalPages = this.getTotalPages();
             const startItem = (this.currentPage - 1) * this.pageSize + 1;
@@ -207,7 +201,6 @@ function createCredsManager(type) {
             document.getElementById(this.getElementId('NextPageBtn')).disabled = this.currentPage >= totalPages;
         },
 
-        // 切换页面
         changePage(direction) {
             const newPage = this.currentPage + direction;
             if (newPage >= 1 && newPage <= this.getTotalPages()) {
@@ -216,14 +209,12 @@ function createCredsManager(type) {
             }
         },
 
-        // 改变每页大小
         changePageSize() {
             this.pageSize = parseInt(document.getElementById(this.getElementId('PageSizeSelect')).value);
             this.currentPage = 1;
             this.refresh();
         },
 
-        // 应用状态筛选
         applyStatusFilter() {
             this.currentStatusFilter = document.getElementById(this.getElementId('StatusFilter')).value;
             const errorCodeFilterEl = document.getElementById(this.getElementId('ErrorCodeFilter'));
@@ -234,7 +225,6 @@ function createCredsManager(type) {
             this.refresh();
         },
 
-        // 更新批量控件
         updateBatchControls() {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
@@ -266,7 +256,6 @@ function createCredsManager(type) {
             });
         },
 
-        // 凭证操作
         async action(filename, action) {
             try {
                 const response = await fetch(this.getEndpoint('action'), {
@@ -288,7 +277,6 @@ function createCredsManager(type) {
             }
         },
 
-        // 批量操作
         async batchAction(action) {
             const selectedFiles = Array.from(this.selectedFiles);
 
@@ -343,8 +331,6 @@ function createUploadManager(type) {
         selectedFiles: [],
 
         getElementId: (suffix) => {
-            // 普通上传的ID首字母小写,如 fileList
-            // Antigravity的ID是 antigravity + 首字母大写,如 antigravityFileList
             if (isAntigravity) {
                 return 'antigravity' + suffix.charAt(0).toUpperCase() + suffix.slice(1);
             }
@@ -375,10 +361,7 @@ function createUploadManager(type) {
             const list = document.getElementById(this.getElementId('FileList'));
             const section = document.getElementById(this.getElementId('FileListSection'));
 
-            if (!list || !section) {
-                console.warn('File list elements not found:', this.getElementId('FileList'));
-                return;
-            }
+            if (!list || !section) return;
 
             if (this.selectedFiles.length === 0) {
                 section.classList.add('hidden');
@@ -437,7 +420,7 @@ function createUploadManager(type) {
 
             try {
                 const xhr = new XMLHttpRequest();
-                xhr.timeout = 300000; // 5分钟
+                xhr.timeout = 300000;
 
                 xhr.upload.onprogress = (event) => {
                     if (event.lengthComputable) {
@@ -468,12 +451,12 @@ function createUploadManager(type) {
                 };
 
                 xhr.onerror = () => {
-                    showStatus(`上传失败：连接中断 - 可能原因：文件过多(${this.selectedFiles.length}个)或网络不稳定。建议分批上传。`, 'error');
+                    showStatus(`上传失败：连接中断`, 'error');
                     progressSection.classList.add('hidden');
                 };
 
                 xhr.ontimeout = () => {
-                    showStatus('上传失败：请求超时 - 文件处理时间过长，请减少文件数量或检查网络连接', 'error');
+                    showStatus('上传失败：请求超时', 'error');
                     progressSection.classList.add('hidden');
                 };
 
@@ -493,25 +476,18 @@ function createUploadManager(type) {
 function showStatus(message, type = 'info') {
     const statusSection = document.getElementById('statusSection');
     if (statusSection) {
-        // 清除之前的定时器
         if (window._statusTimeout) {
             clearTimeout(window._statusTimeout);
         }
-
-        // 创建新的 toast
         statusSection.innerHTML = `<div class="status ${type}">${message}</div>`;
         const statusDiv = statusSection.querySelector('.status');
-
-        // 强制重绘以触发动画
         statusDiv.offsetHeight;
         statusDiv.classList.add('show');
-
-        // 3秒后淡出并移除
         window._statusTimeout = setTimeout(() => {
             statusDiv.classList.add('fade-out');
             setTimeout(() => {
                 statusSection.innerHTML = '';
-            }, 300); // 等待淡出动画完成
+            }, 300);
         }, 3000);
     } else {
         alert(message);
@@ -542,17 +518,15 @@ function formatCooldownTime(remainingSeconds) {
 }
 
 // =====================================================================
-// 凭证卡片创建（通用）
+// 凭证卡片创建（通用）- 包含统计功能修复
 // =====================================================================
 function createCredCard(credInfo, manager) {
     const div = document.createElement('div');
     const { status, filename } = credInfo;
     const isAntigravity = manager.type === 'antigravity';
 
-    // 卡片样式
     div.className = status.disabled ? 'cred-card disabled' : 'cred-card';
 
-    // 状态徽章
     let statusBadges = '';
     statusBadges += status.disabled
         ? '<span class="status-badge disabled">已禁用</span>'
@@ -568,7 +542,11 @@ function createCredCard(credInfo, manager) {
         statusBadges += '<span class="status-badge" style="background-color: #28a745; color: white;">无错误</span>';
     }
 
-    // 模型级冷却状态
+    // [新增] 简略统计展示
+    if (!isAntigravity && (credInfo.daily_usage > 0 || credInfo.daily_usage_pro > 0)) {
+        statusBadges += `<span class="status-badge" style="background-color: #6610f2; margin-left: 4px;">今日: ${credInfo.daily_usage || 0}</span>`;
+    }
+
     if (credInfo.model_cooldowns && Object.keys(credInfo.model_cooldowns).length > 0) {
         const currentTime = Date.now() / 1000;
         const activeCooldowns = Object.entries(credInfo.model_cooldowns)
@@ -596,10 +574,9 @@ function createCredCard(credInfo, manager) {
         }
     }
 
-    // 路径ID
     const pathId = (isAntigravity ? 'ag_' : '') + btoa(encodeURIComponent(filename)).replace(/[+/=]/g, '_');
 
-    // 操作按钮
+    // [新增] 按钮逻辑，包含查看统计按钮
     const actionButtons = `
         ${status.disabled
             ? `<button class="cred-btn enable" data-filename="${filename}" data-action="enable">启用</button>`
@@ -608,18 +585,23 @@ function createCredCard(credInfo, manager) {
         <button class="cred-btn view" onclick="toggle${isAntigravity ? 'Antigravity' : ''}CredDetails('${pathId}')">查看内容</button>
         <button class="cred-btn download" onclick="download${isAntigravity ? 'Antigravity' : ''}Cred('${filename}')">下载</button>
         <button class="cred-btn email" onclick="fetch${isAntigravity ? 'Antigravity' : ''}UserEmail('${filename}')">查看账号邮箱</button>
-        ${isAntigravity ? `<button class="cred-btn" style="background-color: #17a2b8;" onclick="toggleAntigravityQuotaDetails('${pathId}')" title="查看该凭证的额度信息">查看额度</button>` : ''}
+        
+        ${isAntigravity 
+            ? `<button class="cred-btn" style="background-color: #17a2b8;" onclick="toggleAntigravityQuotaDetails('${pathId}')" title="查看该凭证的额度信息">查看额度</button>` 
+            : `<button class="cred-btn" style="background-color: #6610f2;" onclick="toggleCredUsageDetails('${pathId}')" title="查看今日使用统计">查看统计</button>`
+        }
+        
         <button class="cred-btn" style="background-color: #ff9800;" onclick="verify${isAntigravity ? 'Antigravity' : ''}ProjectId('${filename}')" title="重新获取Project ID，可恢复403错误">检验</button>
         <button class="cred-btn delete" data-filename="${filename}" data-action="delete">删除</button>
     `;
 
-    // 邮箱信息
     const emailInfo = credInfo.user_email
         ? `<div class="cred-email" style="font-size: 12px; color: #666; margin-top: 2px;">${credInfo.user_email}</div>`
         : '<div class="cred-email" style="font-size: 12px; color: #999; margin-top: 2px; font-style: italic;">未获取邮箱</div>';
 
     const checkboxClass = manager.getElementId('file-checkbox');
 
+    // [新增] 统计容器
     div.innerHTML = `
         <div class="cred-header">
             <div style="display: flex; align-items: center; gap: 10px;">
@@ -635,16 +617,21 @@ function createCredCard(credInfo, manager) {
         <div class="cred-details" id="details-${pathId}">
             <div class="cred-content" data-filename="${filename}" data-loaded="false">点击"查看内容"按钮加载文件详情...</div>
         </div>
+        
         ${isAntigravity ? `
         <div class="cred-quota-details" id="quota-${pathId}" style="display: none;">
             <div class="cred-quota-content" data-filename="${filename}" data-loaded="false">
                 点击"查看额度"按钮加载额度信息...
             </div>
         </div>
-        ` : ''}
+        ` : `
+        <div class="cred-quota-details" id="usage-${pathId}" style="display: none;">
+            <div class="cred-quota-content" data-filename="${filename}">
+                </div>
+        </div>
+        `}
     `;
 
-    // 添加事件监听
     div.querySelectorAll('[data-filename][data-action]').forEach(button => {
         button.addEventListener('click', function () {
             const fn = this.getAttribute('data-filename');
@@ -744,7 +731,6 @@ async function login() {
             document.getElementById('loginSection').classList.add('hidden');
             document.getElementById('mainSection').classList.remove('hidden');
             showStatus('登录成功', 'success');
-            // 显示面板后初始化滑块
             requestAnimationFrame(() => initTabSlider());
         } else {
             showStatus(`登录失败: ${data.detail || data.error || '未知错误'}`, 'error');
@@ -772,7 +758,6 @@ async function autoLogin() {
             document.getElementById('loginSection').classList.add('hidden');
             document.getElementById('mainSection').classList.remove('hidden');
             showStatus('自动登录成功', 'success');
-            // 显示面板后初始化滑块
             requestAnimationFrame(() => initTabSlider());
             return true;
         } else if (response.status === 401) {
@@ -803,36 +788,29 @@ function handlePasswordEnter(event) {
 // =====================================================================
 // 标签页切换
 // =====================================================================
-
-// 更新滑块位置
 function updateTabSlider(targetTab, animate = true) {
     const slider = document.querySelector('.tab-slider');
     const tabs = document.querySelector('.tabs');
     if (!slider || !tabs || !targetTab) return;
 
-    // 获取按钮位置和容器宽度
     const tabLeft = targetTab.offsetLeft;
     const tabWidth = targetTab.offsetWidth;
     const tabsWidth = tabs.scrollWidth;
 
-    // 使用 left 和 right 同时控制，确保动画同步
     const rightValue = tabsWidth - tabLeft - tabWidth;
 
     if (animate) {
         slider.style.left = `${tabLeft}px`;
         slider.style.right = `${rightValue}px`;
     } else {
-        // 首次加载时不使用动画
         slider.style.transition = 'none';
         slider.style.left = `${tabLeft}px`;
         slider.style.right = `${rightValue}px`;
-        // 强制重绘后恢复过渡
         slider.offsetHeight;
         slider.style.transition = '';
     }
 }
 
-// 初始化滑块位置
 function initTabSlider() {
     const activeTab = document.querySelector('.tab.active');
     if (activeTab) {
@@ -840,7 +818,6 @@ function initTabSlider() {
     }
 }
 
-// 页面加载和窗口大小变化时初始化滑块
 document.addEventListener('DOMContentLoaded', initTabSlider);
 window.addEventListener('resize', () => {
     const activeTab = document.querySelector('.tab.active');
@@ -848,30 +825,22 @@ window.addEventListener('resize', () => {
 });
 
 function switchTab(tabName) {
-    // 获取当前活动的内容区域
     const currentContent = document.querySelector('.tab-content.active');
     const targetContent = document.getElementById(tabName + 'Tab');
 
-    // 如果点击的是当前标签页，不做任何操作
     if (currentContent === targetContent) return;
 
-    // 找到目标标签按钮
     const targetTab = event && event.target ? event.target :
         document.querySelector(`.tab[onclick*="'${tabName}'"]`);
 
-    // 移除所有标签页的active状态
     document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
 
-    // 添加当前点击标签的active状态
     if (targetTab) {
         targetTab.classList.add('active');
-        // 更新滑块位置（带动画）
         updateTabSlider(targetTab, true);
     }
 
-    // 淡出当前内容
     if (currentContent) {
-        // 设置淡出过渡
         currentContent.style.transition = 'opacity 0.18s ease-out, transform 0.18s ease-out';
         currentContent.style.opacity = '0';
         currentContent.style.transform = 'translateX(-12px)';
@@ -882,31 +851,23 @@ function switchTab(tabName) {
             currentContent.style.opacity = '';
             currentContent.style.transform = '';
 
-            // 淡入新内容
             if (targetContent) {
-                // 先设置初始状态（在添加 active 类之前）
                 targetContent.style.opacity = '0';
                 targetContent.style.transform = 'translateX(12px)';
-                targetContent.style.transition = 'none'; // 暂时禁用过渡
+                targetContent.style.transition = 'none';
 
-                // 添加 active 类使元素可见
                 targetContent.classList.add('active');
 
-                // 使用双重 requestAnimationFrame 确保浏览器完成重绘
                 requestAnimationFrame(() => {
                     requestAnimationFrame(() => {
-                        // 启用过渡并应用最终状态
                         targetContent.style.transition = 'opacity 0.25s ease-out, transform 0.25s ease-out';
                         targetContent.style.opacity = '1';
                         targetContent.style.transform = 'translateX(0)';
 
-                        // 清理内联样式并执行数据加载
                         setTimeout(() => {
                             targetContent.style.transition = '';
                             targetContent.style.opacity = '';
                             targetContent.style.transform = '';
-
-                            // 动画完成后触发数据加载
                             triggerTabDataLoad(tabName);
                         }, 260);
                     });
@@ -914,16 +875,13 @@ function switchTab(tabName) {
             }
         }, 180);
     } else {
-        // 如果没有当前内容（首次加载），直接显示目标内容
         if (targetContent) {
             targetContent.classList.add('active');
-            // 直接触发数据加载
             triggerTabDataLoad(tabName);
         }
     }
 }
 
-// 标签页数据加载（从动画中分离出来）
 function triggerTabDataLoad(tabName) {
     if (tabName === 'manage') AppState.creds.refresh();
     if (tabName === 'antigravity-manage') AppState.antigravityCreds.refresh();
@@ -1200,7 +1158,7 @@ async function processCallbackUrl() {
     }
 
     if (!callbackUrl.includes('code=') || !callbackUrl.includes('state=')) {
-        showStatus('❌ 这不是有效的回调URL！请确保：\n1. 已完成Google OAuth授权\n2. 复制的是浏览器地址栏的完整URL\n3. URL包含code和state参数', 'error');
+        showStatus('❌ 这不是有效的回调URL！请确保包含code和state参数', 'error');
         return;
     }
 
@@ -1285,7 +1243,6 @@ async function processAntigravityCallbackUrl() {
 // =====================================================================
 // 全局兼容函数（供HTML调用）
 // =====================================================================
-// 普通凭证管理
 function refreshCredsStatus() { AppState.creds.refresh(); }
 function applyStatusFilter() { AppState.creds.applyStatusFilter(); }
 function changePage(direction) { AppState.creds.changePage(direction); }
@@ -1345,7 +1302,6 @@ async function downloadAllCreds() {
     }
 }
 
-// Antigravity凭证管理
 function refreshAntigravityCredsList() { AppState.antigravityCreds.refresh(); }
 function applyAntigravityStatusFilter() { AppState.antigravityCreds.applyStatusFilter(); }
 function changeAntigravityPage(direction) { AppState.antigravityCreds.changePage(direction); }
@@ -1408,7 +1364,6 @@ async function downloadAllAntigravityCreds() {
     }
 }
 
-// 文件上传
 function handleFileSelect(event) { AppState.uploadFiles.handleFileSelect(event); }
 function removeFile(index) { AppState.uploadFiles.removeFile(index); }
 function clearFiles() { AppState.uploadFiles.clearFiles(); }
@@ -1426,22 +1381,17 @@ function clearAntigravityFiles() { AppState.antigravityUploadFiles.clearFiles();
 function uploadAntigravityFiles() { AppState.antigravityUploadFiles.upload(); }
 
 // 邮箱相关
-// 辅助函数：根据文件名更新卡片中的邮箱显示
 function updateEmailDisplay(filename, email, isAntigravity = false) {
-    // 查找对应的凭证卡片
     const containerId = isAntigravity ? 'antigravityCredsList' : 'credsList';
     const container = document.getElementById(containerId);
     if (!container) return false;
 
-    // 通过 data-filename 找到对应的复选框，再找到其父卡片
     const checkbox = container.querySelector(`input[data-filename="${filename}"]`);
     if (!checkbox) return false;
 
-    // 找到对应的 cred-card 元素
     const card = checkbox.closest('.cred-card');
     if (!card) return false;
 
-    // 找到邮箱显示元素
     const emailDiv = card.querySelector('.cred-email');
     if (emailDiv) {
         emailDiv.textContent = email;
@@ -1462,7 +1412,6 @@ async function fetchUserEmail(filename) {
         const data = await response.json();
         if (response.ok && data.user_email) {
             showStatus(`成功获取邮箱: ${data.user_email}`, 'success');
-            // 直接更新卡片中的邮箱显示，不刷新整个列表
             updateEmailDisplay(filename, data.user_email, false);
         } else {
             showStatus(data.message || '无法获取用户邮箱', 'error');
@@ -1482,7 +1431,6 @@ async function fetchAntigravityUserEmail(filename) {
         const data = await response.json();
         if (response.ok && data.user_email) {
             showStatus(`成功获取邮箱: ${data.user_email}`, 'success');
-            // 直接更新卡片中的邮箱显示，不刷新整个列表
             updateEmailDisplay(filename, data.user_email, true);
         } else {
             showStatus(data.message || '无法获取用户邮箱', 'error');
@@ -1494,7 +1442,6 @@ async function fetchAntigravityUserEmail(filename) {
 
 async function verifyProjectId(filename) {
     try {
-        // 显示加载状态
         showStatus('🔍 正在检验Project ID，请稍候...', 'info');
 
         const response = await fetch(`./creds/verify-project/${encodeURIComponent(filename)}`, {
@@ -1504,16 +1451,11 @@ async function verifyProjectId(filename) {
         const data = await response.json();
 
         if (response.ok && data.success) {
-            // 成功时显示绿色成功消息和Project ID
             const successMsg = `✅ 检验成功！\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`;
             showStatus(successMsg.replace(/\n/g, '<br>'), 'success');
-
-            // 弹出成功提示
             alert(`✅ 检验成功！\n\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`);
-
             await AppState.creds.refresh();
         } else {
-            // 失败时显示红色错误消息
             const errorMsg = data.message || '检验失败';
             showStatus(`❌ ${errorMsg}`, 'error');
             alert(`❌ 检验失败\n\n${errorMsg}`);
@@ -1527,7 +1469,6 @@ async function verifyProjectId(filename) {
 
 async function verifyAntigravityProjectId(filename) {
     try {
-        // 显示加载状态
         showStatus('🔍 正在检验Antigravity Project ID，请稍候...', 'info');
 
         const response = await fetch(`./antigravity/creds/verify-project/${encodeURIComponent(filename)}`, {
@@ -1537,16 +1478,11 @@ async function verifyAntigravityProjectId(filename) {
         const data = await response.json();
 
         if (response.ok && data.success) {
-            // 成功时显示绿色成功消息和Project ID
             const successMsg = `✅ 检验成功！\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`;
             showStatus(successMsg.replace(/\n/g, '<br>'), 'success');
-
-            // 弹出成功提示
             alert(`✅ Antigravity检验成功！\n\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`);
-
             await AppState.antigravityCreds.refresh();
         } else {
-            // 失败时显示红色错误消息
             const errorMsg = data.message || '检验失败';
             showStatus(`❌ ${errorMsg}`, 'error');
             alert(`❌ 检验失败\n\n${errorMsg}`);
@@ -1562,21 +1498,17 @@ async function toggleAntigravityQuotaDetails(pathId) {
     const quotaDetails = document.getElementById('quota-' + pathId);
     if (!quotaDetails) return;
 
-    // 切换显示状态
     const isShowing = quotaDetails.style.display === 'block';
 
     if (isShowing) {
-        // 收起
         quotaDetails.style.display = 'none';
     } else {
-        // 展开
         quotaDetails.style.display = 'block';
 
         const contentDiv = quotaDetails.querySelector('.cred-quota-content');
         const filename = contentDiv.getAttribute('data-filename');
         const loaded = contentDiv.getAttribute('data-loaded');
 
-        // 如果还没加载过，则加载数据
         if (loaded === 'false' && filename) {
             contentDiv.innerHTML = '<div style="text-align: center; padding: 20px; color: #666;">📊 正在加载额度信息...</div>';
 
@@ -1588,7 +1520,6 @@ async function toggleAntigravityQuotaDetails(pathId) {
                 const data = await response.json();
 
                 if (response.ok && data.success) {
-                    // 成功时渲染美化的额度信息
                     const models = data.models || {};
 
                     if (Object.keys(models).length === 0) {
@@ -1611,19 +1542,15 @@ async function toggleAntigravityQuotaDetails(pathId) {
                         `;
 
                         for (const [modelName, quotaData] of Object.entries(models)) {
-                            // 后端返回的是剩余比例 (0-1)，不是绝对数量
                             const remainingFraction = quotaData.remaining || 0;
                             const resetTime = quotaData.resetTime || 'N/A';
-
-                            // 计算已使用百分比（1 - 剩余比例）
                             const usedPercentage = Math.round((1 - remainingFraction) * 100);
                             const remainingPercentage = Math.round(remainingFraction * 100);
 
-                            // 根据使用情况选择颜色
-                            let percentageColor = '#28a745'; // 绿色：使用少
-                            if (usedPercentage >= 90) percentageColor = '#dc3545'; // 红色：使用多
-                            else if (usedPercentage >= 70) percentageColor = '#ffc107'; // 黄色：使用较多
-                            else if (usedPercentage >= 50) percentageColor = '#17a2b8'; // 蓝色：使用中等
+                            let percentageColor = '#28a745';
+                            if (usedPercentage >= 90) percentageColor = '#dc3545';
+                            else if (usedPercentage >= 70) percentageColor = '#ffc107';
+                            else if (usedPercentage >= 50) percentageColor = '#17a2b8';
 
                             quotaHTML += `
                                 <div style="background: white; border-left: 4px solid ${percentageColor}; border-radius: 4px; padding: 8px 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
@@ -1635,11 +1562,8 @@ async function toggleAntigravityQuotaDetails(pathId) {
                                             ${remainingPercentage}%
                                         </div>
                                     </div>
-                                    <div style="width: 100%; height: 8px; background-color: #e9ecef; border-radius: 4px; overflow: hidden; margin-bottom: 4px;">
+                                    <div style="width: 100%; height: 8px; background-color: #e9ecef; border-radius: 4px; overflow: hidden;">
                                         <div style="width: ${usedPercentage}%; height: 100%; background-color: ${percentageColor}; transition: width 0.3s ease;"></div>
-                                    </div>
-                                    <div style="font-size: 10px; color: #666; text-align: right;">
-                                        ${resetTime !== 'N/A' ? '🔄 ' + resetTime : ''}
                                     </div>
                                 </div>
                             `;
@@ -1652,7 +1576,6 @@ async function toggleAntigravityQuotaDetails(pathId) {
                     contentDiv.setAttribute('data-loaded', 'true');
                     showStatus('✅ 成功加载额度信息', 'success');
                 } else {
-                    // 失败时显示错误
                     const errorMsg = data.error || '获取额度信息失败';
                     contentDiv.innerHTML = `
                         <div style="text-align: center; padding: 20px; color: #dc3545;">
@@ -1691,7 +1614,6 @@ async function batchVerifyProjectIds() {
 
     showStatus(`🔍 正在并行检验 ${selectedFiles.length} 个凭证，请稍候...`, 'info');
 
-    // 并行执行所有检验请求
     const promises = selectedFiles.map(async (filename) => {
         try {
             const response = await fetch(`./creds/verify-project/${encodeURIComponent(filename)}`, {
@@ -1710,10 +1632,8 @@ async function batchVerifyProjectIds() {
         }
     });
 
-    // 等待所有请求完成
     const results = await Promise.all(promises);
 
-    // 统计结果
     let successCount = 0;
     let failCount = 0;
     const resultMessages = [];
@@ -1758,7 +1678,6 @@ async function batchVerifyAntigravityProjectIds() {
 
     showStatus(`🔍 正在并行检验 ${selectedFiles.length} 个Antigravity凭证，请稍候...`, 'info');
 
-    // 并行执行所有检验请求
     const promises = selectedFiles.map(async (filename) => {
         try {
             const response = await fetch(`./antigravity/creds/verify-project/${encodeURIComponent(filename)}`, {
@@ -1777,10 +1696,8 @@ async function batchVerifyAntigravityProjectIds() {
         }
     });
 
-    // 等待所有请求完成
     const results = await Promise.all(promises);
 
-    // 统计结果
     let successCount = 0;
     let failCount = 0;
     const resultMessages = [];
@@ -1810,7 +1727,6 @@ async function batchVerifyAntigravityProjectIds() {
     console.log(summary);
     alert(summary);
 }
-
 
 async function refreshAllEmails() {
     if (!confirm('确定要刷新所有凭证的用户邮箱吗？这可能需要一些时间。')) return;
@@ -2427,7 +2343,6 @@ function stopCooldownTimer() {
 function updateCooldownDisplays() {
     let needsRefresh = false;
 
-    // 检查模型级冷却是否过期
     for (const credInfo of Object.values(AppState.creds.data)) {
         if (credInfo.model_cooldowns && Object.keys(credInfo.model_cooldowns).length > 0) {
             const currentTime = Date.now() / 1000;
@@ -2445,7 +2360,6 @@ function updateCooldownDisplays() {
         return;
     }
 
-    // 更新模型级冷却的显示
     document.querySelectorAll('.cooldown-badge').forEach(badge => {
         const card = badge.closest('.cred-card');
         const filenameEl = card?.querySelector('.cred-filename');
@@ -2492,7 +2406,9 @@ window.onload = async function () {
     }
 };
 
+// =====================================================================
 // 拖拽功能 - 初始化
+// =====================================================================
 document.addEventListener('DOMContentLoaded', function () {
     const uploadArea = document.getElementById('uploadArea');
 
@@ -2514,3 +2430,57 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 });
+
+// =====================================================================
+// [新增] 切换显示普通凭证的使用统计 (功能函数)
+// =====================================================================
+async function toggleCredUsageDetails(pathId) {
+    const usageDetails = document.getElementById('usage-' + pathId);
+    if (!usageDetails) return;
+
+    // 切换显示状态
+    const isShowing = usageDetails.style.display === 'block';
+
+    if (isShowing) {
+        // 收起
+        usageDetails.style.display = 'none';
+    } else {
+        // 展开
+        usageDetails.style.display = 'block';
+
+        const contentDiv = usageDetails.querySelector('.cred-quota-content');
+        const filename = contentDiv.getAttribute('data-filename');
+        
+        // 从本地状态获取数据 (数据已经在 refresh() 时加载了)
+        const credInfo = AppState.creds.data[filename];
+        
+        if (credInfo) {
+            const usage = credInfo.daily_usage || 0;
+            const usagePro = credInfo.daily_usage_pro || 0;
+            
+            // 渲染界面 (使用紫色主题以示区分)
+            contentDiv.innerHTML = `
+                <div style="background: linear-gradient(135deg, #6610f2 0%, #6f42c1 100%); color: white; padding: 15px; border-radius: 8px 8px 0 0; margin: -10px -10px 15px -10px;">
+                    <h4 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">
+                        <span style="font-size: 20px;">📊</span>
+                        <span>今日使用统计 (北京时间16:00重置)</span>
+                    </h4>
+                    <div style="font-size: 12px; opacity: 0.9; margin-top: 5px;">文件: ${filename}</div>
+                </div>
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                    <div style="background: #f8f9fa; border-left: 4px solid #007bff; border-radius: 4px; padding: 15px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                        <div style="font-size: 12px; color: #666; margin-bottom: 5px;">总调用次数</div>
+                        <div style="font-size: 24px; font-weight: bold; color: #333;">${usage}</div>
+                    </div>
+                    <div style="background: #f8f9fa; border-left: 4px solid #6f42c1; border-radius: 4px; padding: 15px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                        <div style="font-size: 12px; color: #666; margin-bottom: 5px;">Pro模型调用</div>
+                        <div style="font-size: 24px; font-weight: bold; color: #333;">${usagePro}</div>
+                    </div>
+                </div>
+            `;
+        } else {
+            contentDiv.innerHTML = '<div style="padding:15px; text-align:center; color:#666;">无法获取统计数据</div>';
+        }
+    }
+}

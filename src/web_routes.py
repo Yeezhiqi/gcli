@@ -634,6 +634,9 @@ async def get_creds_status_common(
                 "last_success": summary["last_success"],
                 "backend_type": backend_type,
                 "model_cooldowns": summary.get("model_cooldowns", {}),
+                # [新增] 添加统计字段
+                "daily_usage": summary.get("daily_usage", 0),
+                "daily_usage_pro": summary.get("daily_usage_pro", 0),
             }
 
             creds_list.append(cred_info)
@@ -684,6 +687,9 @@ async def get_creds_status_common(
             "last_success": file_status.get("last_success", time.time()),
             "backend_type": backend_type,
             "model_cooldowns": file_status.get("model_cooldowns", {}),
+            # [新增] 添加统计字段
+            "daily_usage": file_status.get("daily_usage", 0),
+            "daily_usage_pro": file_status.get("daily_usage_pro", 0),
         }
 
         creds_list.append(cred_info)

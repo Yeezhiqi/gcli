@@ -230,7 +230,9 @@ class CredentialInfo(BaseModel):
     size: Optional[int] = None
     modified_time: Optional[str] = None
     error: Optional[str] = None
-
+    # [新增]
+    daily_usage: Optional[int] = 0
+    daily_usage_pro: Optional[int] = 0
 
 class LogEntry(BaseModel):
     timestamp: str

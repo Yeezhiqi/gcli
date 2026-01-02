@@ -1,10 +1,11 @@
+
 """
 凭证管理器
 """
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta  # 新增 timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from log import log
@@ -206,6 +207,24 @@ class CredentialManager:
             log.error(f"Error getting credential statuses: {e}")
             return {}
 
+    def _get_daily_reset_timestamp(self) -> float:
+        """
+        获取当前统计周期的重置时间戳（北京时间下午4点 = UTC 08:00）
+        """
+        now_utc = datetime.now(timezone.utc)
+        # 如果当前UTC时间小于8点，说明还在昨天的统计周期内
+        # 北京时间 16:00 = UTC 08:00
+        if now_utc.hour < 8:
+            reset_date = now_utc.date() - timedelta(days=1)
+        else:
+            reset_date = now_utc.date()
+
+        reset_dt = datetime(
+            reset_date.year, reset_date.month, reset_date.day,
+            8, 0, 0, tzinfo=timezone.utc
+        )
+        return reset_dt.timestamp()
+
     async def get_creds_summary(self) -> List[Dict[str, Any]]:
         """
         获取所有凭证的摘要信息（轻量级，不包含完整凭证数据）
@@ -222,8 +241,19 @@ class CredentialManager:
 
             import time
             current_time = time.time()
+            reset_ts = self._get_daily_reset_timestamp()
 
             for filename, state in all_states.items():
+                # 计算显示的额度
+                usage_count = state.get("daily_usage", 0)
+                usage_count_pro = state.get("daily_usage_pro", 0)
+                last_reset = state.get("last_usage_reset", 0)
+
+                # 如果记录的重置时间早于当前的重置周期，说明数据是旧的，显示为0
+                if last_reset < reset_ts:
+                    usage_count = 0
+                    usage_count_pro = 0
+
                 summaries.append({
                     "filename": filename,
                     "disabled": state.get("disabled", False),
@@ -231,6 +261,9 @@ class CredentialManager:
                     "last_success": state.get("last_success", current_time),
                     "user_email": state.get("user_email"),
                     "model_cooldowns": state.get("model_cooldowns", {}),
+                    # 新增统计字段
+                    "daily_usage": usage_count,
+                    "daily_usage_pro": usage_count_pro,
                 })
 
             return summaries
@@ -320,6 +353,39 @@ class CredentialManager:
                         await self._storage_adapter._backend.set_model_cooldown(
                             credential_name, model_key, None, is_antigravity=is_antigravity
                         )
+
+                # ================= 统计逻辑 (仅针对标准 CLI 凭证) =================
+                if not is_antigravity:
+                    try:
+                        # 1. 获取当前状态
+                        current_state = await self._storage_adapter.get_credential_state(credential_name, is_antigravity=False)
+                        
+                        # 2. 计算周期重置时间
+                        reset_ts = self._get_daily_reset_timestamp()
+                        last_reset = current_state.get("last_usage_reset", 0)
+                        
+                        daily_usage = current_state.get("daily_usage", 0)
+                        daily_usage_pro = current_state.get("daily_usage_pro", 0)
+
+                        # 3. 检查是否需要重置
+                        if last_reset < reset_ts:
+                            daily_usage = 0
+                            daily_usage_pro = 0
+                            state_updates["last_usage_reset"] = reset_ts
+
+                        # 4. 增加计数
+                        daily_usage += 1
+                        state_updates["daily_usage"] = daily_usage
+
+                        if model_key == "pro":
+                            daily_usage_pro += 1
+                            state_updates["daily_usage_pro"] = daily_usage_pro
+                            
+                        log.debug(f"[USAGE] {credential_name}: Total={daily_usage}, Pro={daily_usage_pro}")
+
+                    except Exception as usage_err:
+                        log.error(f"Error updating usage stats for {credential_name}: {usage_err}")
+                # ===============================================================
 
             elif error_code:
                 # 记录错误码

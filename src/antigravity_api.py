@@ -100,12 +100,20 @@ def build_antigravity_request_body(
     if system_instruction:
         request_body["request"]["systemInstruction"] = system_instruction
 
+    # === [修改开始: 智能处理工具配置] ===
     # 添加工具定义
     if tools:
         request_body["request"]["tools"] = tools
-        request_body["request"]["toolConfig"] = {
-            "functionCallingConfig": {"mode": "VALIDATED"}
-        }
+        
+        # 只有当 tools 中包含 functionDeclarations 时，才添加 functionCallingConfig
+        # 避免纯搜索请求 (googleSearchRetrieval) 被错误的配置干扰
+        has_functions = any("functionDeclarations" in tool for tool in tools)
+        
+        if has_functions:
+            request_body["request"]["toolConfig"] = {
+                "functionCallingConfig": {"mode": "VALIDATED"}
+            }
+    # === [修改结束] ===
 
     # 添加生成配置
     if generation_config:
@@ -456,13 +464,13 @@ async def fetch_available_models(
                         model_list.append(model_to_dict(model))
 
                 # 添加额外的 claude-opus-4-5 模型
-                claude_opus_model = Model(
-                    id='claude-opus-4-5',
-                    object='model',
-                    created=current_timestamp,
-                    owned_by='google'
-                )
-                model_list.append(model_to_dict(claude_opus_model))
+                #claude_opus_model = Model(
+                #    id='claude-opus-4-5',
+                #    object='model',
+                #    created=current_timestamp,
+                #    owned_by='google'
+                #)
+                #model_list.append(model_to_dict(claude_opus_model))
 
                 log.info(f"[ANTIGRAVITY] Fetched {len(model_list)} available models")
                 return model_list
