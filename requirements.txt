@@ -10,8 +10,9 @@ oauthlib>=3.3.1
 motor>=3.7.1
 aiosqlite>=0.20.0
 pypinyin>=0.51.0
-google-generativeai
+google.genai
 toml
 redis
 asyncpg
 pypinyin
+asyncio
