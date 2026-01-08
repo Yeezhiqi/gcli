@@ -2,33 +2,18 @@
 Antigravity Router - Handles OpenAI and Gemini format requests and converts to Antigravity API
 处理 OpenAI 和 Gemini 格式请求并转换为 Antigravity API 格式
 """
-import httpx
-from config import get_google_search_config
+import asyncio
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import get_anti_truncation_max_attempts
 from log import log
-
-import asyncio  # 确保导入了 asyncio
-# ... 其他导入 ...
-from .task_manager import create_managed_task  # 新增导入
-from .utils import (
-    is_anti_truncation_model,
-    authenticate_bearer,
-    authenticate_gemini_flexible,
-    authenticate_sdwebui_flexible,
-    get_base_model_from_feature_model,
-    is_search_model,        # 新增
-    get_base_model_name,    # 新增
-    is_fake_streaming_model, # 确保导入了 is_fake_streaming_model
-)
-
+from .utils import is_anti_truncation_model, authenticate_bearer, authenticate_gemini_flexible, authenticate_sdwebui_flexible, is_fake_streaming_model, get_base_model_from_feature_model
 from .antigravity_api import (
     build_antigravity_request_body,
     send_antigravity_request_no_stream,
@@ -51,7 +36,6 @@ from .models import (
 from .anti_truncation import (
     apply_anti_truncation_to_stream,
 )
-
 
 # 创建路由器
 router = APIRouter()
@@ -86,9 +70,6 @@ def model_mapping(model_name: str) -> str:
     }
     return mapping.get(model_name, model_name)
 
-def is_search_model(model_name: str) -> bool:
-    """检测是否是搜索模型"""
-    return "-search" in model_name or "search" in model_name.split("-")
 
 def is_thinking_model(model_name: str) -> bool:
     """检测是否是思考模型"""
@@ -259,9 +240,20 @@ def convert_openai_tools_to_antigravity(tools: Optional[List[Any]]) -> Optional[
     if not tools:
         return None
 
-    # 需要排除的字段
-    EXCLUDED_KEYS = {'$schema', 'additionalProperties', 'minLength', 'maxLength',
-                     'minItems', 'maxItems', 'uniqueItems'}
+    # 需要排除的字段 - 与 _clean_schema_for_gemini 保持一致
+    # Gemini/Antigravity API 不支持这些 JSON Schema 字段
+    # 参考: github.com/googleapis/python-genai/issues/699, #388, #460, #1122, #264, #4551
+    EXCLUDED_KEYS = {
+        '$schema', '$id', '$ref', '$defs', 'definitions',
+        'example', 'examples', 'readOnly', 'writeOnly', 'default',
+        'exclusiveMaximum', 'exclusiveMinimum',
+        'oneOf', 'anyOf', 'allOf', 'const',
+        'additionalItems', 'contains', 'patternProperties', 'dependencies',
+        'propertyNames', 'if', 'then', 'else',
+        'contentEncoding', 'contentMediaType',
+        'additionalProperties', 'minLength', 'maxLength',
+        'minItems', 'maxItems', 'uniqueItems'
+    }
 
     def clean_parameters(obj):
         """递归清理参数对象"""
@@ -366,6 +358,37 @@ def generate_generation_config(
         return config_dict
 
 
+def prepare_image_request(request_body: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """图像生成模型请求体后处理"""
+    model_lower = model.lower()
+    
+    # 解析分辨率
+    image_size = "4K" if "-4k" in model_lower else "2K" if "-2k" in model_lower else None
+    
+    # 解析比例
+    aspect_ratio = None
+    for suffix, ratio in [("-21x9", "21:9"), ("-16x9", "16:9"), ("-9x16", "9:16"), ("-4x3", "4:3"), ("-3x4", "3:4"), ("-1x1", "1:1")]:
+        if suffix in model_lower:
+            aspect_ratio = ratio
+            break
+    
+    # 构建 imageConfig
+    image_config = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+
+    request_body["requestType"] = "image_gen"
+    request_body["model"] = "gemini-3-pro-image"  # 统一使用基础模型名
+    request_body["request"]["generationConfig"] = {"candidateCount": 1, "imageConfig": image_config}
+    for key in ("systemInstruction", "tools", "toolConfig"):
+        request_body["request"].pop(key, None)
+    return request_body
+
+
+
+
 def convert_to_openai_tool_call(function_call: Dict[str, Any]) -> Dict[str, Any]:
     """
     将 Antigravity functionCall 转换为 OpenAI tool_call，使用 OpenAIToolCall 模型
@@ -396,14 +419,12 @@ async def convert_antigravity_stream_to_openai(
     Args:
         lines_generator: 行生成器 (已经过滤的 SSE 行)
     """
-
     state = {
         "thinking_started": False,
         "tool_calls": [],
         "content_buffer": "",
         "thinking_buffer": "",
-        "success_recorded": False,
-        "grounding_sources": [] # <--- 新增状态：存储搜索来源
+        "success_recorded": False
     }
 
     created = int(time.time())
@@ -440,7 +461,7 @@ async def convert_antigravity_stream_to_openai(
             # 记录第一次成功响应
             if not state["success_recorded"]:
                 if credential_name and credential_manager:
-                    await credential_manager.record_api_call_result(credential_name, True, is_antigravity=True)
+                    await credential_manager.record_api_call_result(credential_name, True, mode="antigravity")
                 state["success_recorded"] = True
 
             # 解析 SSE 数据
@@ -449,25 +470,8 @@ async def convert_antigravity_stream_to_openai(
             except:
                 continue
 
-            # 获取 candidate
-            candidate = data.get("response", {}).get("candidates", [{}])[0]
-            
-            # === [修改点 3: 捕获搜索元数据] ===
-            # 注意：在流式传输中，groundingMetadata 可能随任意 chunk 返回
-            grounding_metadata = candidate.get("groundingMetadata")
-            if grounding_metadata:
-                chunks = grounding_metadata.get("groundingChunks", [])
-                for i, chunk in enumerate(chunks, 1):
-                    web = chunk.get("web", {})
-                    if web:
-                        title = web.get("title", "Source")
-                        uri = web.get("uri", "")
-                        if title and uri:
-                            state["grounding_sources"].append(f"[{title}]({uri})")
-            # ====================================
-
             # 提取 parts
-            parts = candidate.get("content", {}).get("parts", [])
+            parts = data.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
             for part in parts:
                 # 处理思考内容
@@ -547,17 +551,7 @@ async def convert_antigravity_stream_to_openai(
                     yield build_content_chunk(thinking_block)
 
                 # 发送工具调用
-                # === [修改点 4: 在结束前发送搜索来源] ===
-                if state["grounding_sources"]:
-                    # 去重并格式化
-                    unique_sources = list(dict.fromkeys(state["grounding_sources"])) # 简单去重
-                    formatted_sources = []
-                    for i, src in enumerate(unique_sources, 1):
-                        formatted_sources.append(f"{i}. {src}")
-                    
-                    sources_text = "\n\n**Search Sources:**\n" + "\n".join(formatted_sources)
-                    
-                    # 发送来源文本块
+                if state["tool_calls"]:
                     chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -565,12 +559,11 @@ async def convert_antigravity_stream_to_openai(
                         "model": model,
                         "choices": [{
                             "index": 0,
-                            "delta": {"content": sources_text},
+                            "delta": {"tool_calls": state["tool_calls"]},
                             "finish_reason": None
                         }]
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
-                # ==========================================
 
                 # 发送使用统计
                 usage_metadata = data.get("response", {}).get("usageMetadata", {})
@@ -634,12 +627,8 @@ def convert_antigravity_response_to_openai(
     """
     将 Antigravity 非流式响应转换为 OpenAI 格式
     """
-    # === [修改点 1：必须先在这里定义 candidate 变量] ===
-    candidate = response_data.get("response", {}).get("candidates", [{}])[0]
-    # =================================================
-
-    # 提取 parts (使用上面定义好的 candidate)
-    parts = candidate.get("content", {}).get("parts", [])
+    # 提取 parts
+    parts = response_data.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
     content = ""
     thinking_content = ""
@@ -666,25 +655,6 @@ def convert_antigravity_response_to_openai(
         elif "functionCall" in part:
             tool_calls_list.append(convert_to_openai_tool_call(part["functionCall"]))
 
-
-    # === [修改点 2: 解析并追加搜索来源] ===
-    grounding_metadata = candidate.get("groundingMetadata")
-    if grounding_metadata:
-        chunks = grounding_metadata.get("groundingChunks", [])
-        sources = []
-        for i, chunk in enumerate(chunks, 1):
-            web = chunk.get("web", {})
-            if web:
-                title = web.get("title", "Source")
-                uri = web.get("uri", "")
-                if title and uri:
-                    sources.append(f"{i}. [{title}]({uri})")
-        
-        # 如果有搜索来源，追加到内容末尾
-        if sources:
-            content += "\n\n**Search Sources:**\n" + "\n".join(sources)
-    # ==========================================
-
     # 拼接思考内容
     if thinking_content:
         content = f"<think>\n{thinking_content}\n</think>\n{content}"
@@ -701,7 +671,7 @@ def convert_antigravity_response_to_openai(
     if tool_calls_list:
         finish_reason = "tool_calls"
 
-    finish_reason_raw = candidate.get("finishReason")
+    finish_reason_raw = response_data.get("response", {}).get("candidates", [{}])[0].get("finishReason")
     if finish_reason_raw == "MAX_TOKENS":
         finish_reason = "length"
 
@@ -768,7 +738,7 @@ async def convert_antigravity_stream_to_gemini(
             # 记录第一次成功响应
             if not success_recorded:
                 if credential_name and credential_manager:
-                    await credential_manager.record_api_call_result(credential_name, True, is_antigravity=True)
+                    await credential_manager.record_api_call_result(credential_name, True, mode="antigravity")
                 success_recorded = True
 
             # 解析 SSE 数据
@@ -822,38 +792,21 @@ async def list_models():
             log.warning("[ANTIGRAVITY] Failed to fetch models from API, returning empty list")
             return ModelList(data=[])
 
-        # models 已经是 OpenAI 格式的字典列表，扩展为包含各种变体
+        # models 已经是 OpenAI 格式的字典列表，扩展为包含抗截断版本
         expanded_models = []
         for model in models:
-            model_id = model["id"]
-
-            # 1. 原始模型
+            # 添加原始模型
             expanded_models.append(Model(**model))
 
-            # 2. 搜索版本 (-search)
-            search_model = model.copy()
-            search_model["id"] = f"{model_id}-search"
-            expanded_models.append(Model(**search_model))
+            # 添加假流式版本
+            fake_model = model.copy()
+            fake_model["id"] = f"假流式/{model['id']}"
+            expanded_models.append(Model(**fake_model))
 
-            # 3. 流式抗截断版本 (流式抗截断/...)
-            at_model = model.copy()
-            at_model["id"] = f"流式抗截断/{model_id}"
-            expanded_models.append(Model(**at_model))
-
-            # 4. [新增] 流式抗截断 + 搜索 (流式抗截断/...-search)
-            at_search_model = model.copy()
-            at_search_model["id"] = f"流式抗截断/{model_id}-search"
-            expanded_models.append(Model(**at_search_model))
-
-            # 5. 假流式版本 (假流式/...)
-            fs_model = model.copy()
-            fs_model["id"] = f"假流式/{model_id}"
-            expanded_models.append(Model(**fs_model))
-
-            # 6. [新增] 假流式 + 搜索 (假流式/...-search)
-            fs_search_model = model.copy()
-            fs_search_model["id"] = f"假流式/{model_id}-search"
-            expanded_models.append(Model(**fs_search_model))
+            # 添加流式抗截断版本
+            anti_truncation_model = model.copy()
+            anti_truncation_model["id"] = f"流式抗截断/{model['id']}"
+            expanded_models.append(Model(**anti_truncation_model))
 
         return ModelList(data=expanded_models)
 
@@ -863,153 +816,77 @@ async def list_models():
         return ModelList(data=[])
 
 
-
-async def antigravity_fake_stream_response(
-    request_body: Dict[str, Any],
-    cred_mgr: Any,
-    model: str,
-    request_id: str
-) -> StreamingResponse:
-    """处理 Antigravity 假流式响应"""
-
-    async def stream_generator():
-        try:
-            # 1. 发送心跳包防止超时
-            heartbeat = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "finish_reason": None,
-                    }
-                ]
+async def aggregate_antigravity_stream(resources: Tuple[Any, Any, Any]) -> Dict[str, Any]:
+    """
+    后端聚合逻辑：遍历流式数据块，提取 parts 并拼接成完整的 response 对象。
+    """
+    lines_generator, stream_ctx, client = resources
+    
+    # 初始化符合 Antigravity 响应结构的字典
+    aggregated_data = {
+        "response": {
+            "candidates": [
+                {
+                    "content": {"parts": [], "role": "model"},
+                    "index": 0,
+                    "finishReason": "STOP"
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 0,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 0
             }
-            yield f"data: {json.dumps(heartbeat)}\n\n"
-
-            # 2. 异步发送实际的非流式请求
-            async def get_response():
-                # 使用 send_antigravity_request_no_stream 发送请求
-                return await send_antigravity_request_no_stream(request_body, cred_mgr)
-
-            # 创建受管理的任务
-            response_task = create_managed_task(get_response(), name="antigravity_fake_stream_request")
+        }
+    }
+    
+    try:
+        # 开始“静默消费”流
+        async for line in lines_generator:
+            if not line or not line.startswith("data: "):
+                continue
+            
+            raw_data = line[6:].strip()
+            if raw_data == "[DONE]":
+                continue
 
             try:
-                # 3. 循环等待响应，每3秒发送一次心跳
-                while not response_task.done():
-                    await asyncio.sleep(3.0)
-                    if not response_task.done():
-                        yield f"data: {json.dumps(heartbeat)}\n\n"
-
-                # 4. 获取响应结果
-                # response_data 是 API 返回的字典, cred_name 和 cred_data 是凭证信息
-                response_data, _, _ = await response_task
-
-            except asyncio.CancelledError:
-                response_task.cancel()
-                raise
-            except Exception as e:
-                response_task.cancel()
-                log.error(f"[ANTIGRAVITY] Fake streaming request failed: {e}")
-                # 发送错误信息给客户端
-                error_chunk = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": f"\n\n[Error: {str(e)}]"},
-                        "finish_reason": "stop"
-                    }]
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            # 5. 将非流式响应转换为 OpenAI 格式
-            try:
-                # 使用现有的转换函数获取完整的 OpenAI 响应对象
-                openai_response = convert_antigravity_response_to_openai(response_data, model, request_id)
+                data = json.loads(raw_data)
+                chunk_resp = data.get("response", {})
                 
-                # 提取内容
-                choice = openai_response.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                content = message.get("content", "")
-                tool_calls = message.get("tool_calls")
+                # 聚合内容：将流式中的 parts 逐一存入聚合列表
+                candidates = chunk_resp.get("candidates", [])
+                if candidates:
+                    candidate = candidates[0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        aggregated_data["response"]["candidates"][0]["content"]["parts"].extend(
+                            candidate["content"]["parts"]
+                        )
+                    
+                    # 保留最后一个结束原因
+                    if "finishReason" in candidate:
+                        aggregated_data["response"]["candidates"][0]["finishReason"] = candidate["finishReason"]
                 
-                # 如果有内容，发送内容块
-                if content:
-                    content_chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": content},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(content_chunk)}\n\n"
-
-                # 如果有工具调用，发送工具调用块
-                if tool_calls:
-                    tool_chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"tool_calls": tool_calls},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(tool_chunk)}\n\n"
-
-                # 6. 发送结束块 (包含 finish_reason 和 usage)
-                finish_chunk = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": choice.get("finish_reason", "stop")
-                    }],
-                    "usage": openai_response.get("usage")
-                }
-                yield f"data: {json.dumps(finish_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
+                # 聚合 Token 统计
+                if "usageMetadata" in chunk_resp:
+                    aggregated_data["response"]["usageMetadata"].update(chunk_resp["usageMetadata"])
+                    
             except Exception as e:
-                log.error(f"[ANTIGRAVITY] Error processing response for fake streaming: {e}")
-                # 发送处理错误
-                err_chunk = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": "[Error processing response]"},
-                        "finish_reason": "stop"
-                    }]
-                }
-                yield f"data: {json.dumps(err_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-        except Exception as e:
-            log.error(f"[ANTIGRAVITY] Fake stream generator error: {e}")
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+                log.debug(f"[ANTIGRAVITY AGGREGATE] Chunk parsing failed: {e}")
+                continue
+                
+        return aggregated_data
+        
+    finally:
+        # 严格执行资源释放，防止连接泄露
+        try:
+            await stream_ctx.__aexit__(None, None, None)
+        except:
+            pass
+        try:
+            await client.aclose()
+        except:
+            pass
 
 
 @router.post("/antigravity/v1/chat/completions")
@@ -1052,34 +929,23 @@ async def chat_completions(
 
     # 提取参数
     model = request_data.model
+
     messages = request_data.messages
     stream = getattr(request_data, "stream", False)
     tools = getattr(request_data, "tools", None)
 
-    # === [修改开始] ===
-    
-    # 1. 检测是否启用搜索
-    use_search = is_search_model(model)
-
-    # 1. 检测假流式模式
-    use_fake_streaming = is_fake_streaming_model(model)
+    # 处理功能前缀
+    use_fake_streaming = model.startswith("假流式/")
+    # 剥离前缀获取原始模型名
     if use_fake_streaming:
-        # 去掉 "假流式/" 前缀
-        from src.utils import get_base_model_from_feature_model
-        model = get_base_model_from_feature_model(model)
-    
-    # 2. 检测并处理抗截断模式 (保持原有的逻辑)
+        model = model.replace("假流式/", "")
+
+    # 检测并处理抗截断模式
     use_anti_truncation = is_anti_truncation_model(model)
     if use_anti_truncation:
         # 去掉 "流式抗截断/" 前缀
         from src.utils import get_base_model_from_feature_model
         model = get_base_model_from_feature_model(model)
-
-    # 3. 处理搜索模式 (新增逻辑)
-    if use_search:
-        model = model.replace("-search", "").replace("-online", "")
-    # === [修改结束] ===
-
 
     # 模型名称映射
     actual_model = model_mapping(model)
@@ -1097,29 +963,6 @@ async def chat_completions(
     # 转换工具定义
     antigravity_tools = convert_openai_tools_to_antigravity(tools)
 
-    # === [修改: 注入搜索工具] ===
-    if use_search:
-        search_tool_def = {
-            "name": "search",
-            "description": "Google Search tool. Use this to search for real-time information.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"}
-                },
-                "required": ["query"]
-            }
-        }
-        
-        # 将其添加到 functionDeclarations
-        if antigravity_tools is None:
-            antigravity_tools = [{"functionDeclarations": [search_tool_def]}]
-        else:
-            # 简单的合并逻辑，假设现有 tools 结构兼容
-            if "functionDeclarations" in antigravity_tools[0]:
-                antigravity_tools[0]["functionDeclarations"].append(search_tool_def)
-
-
     # 生成配置参数
     parameters = {
         "temperature": getattr(request_data, "temperature", None),
@@ -1132,7 +975,7 @@ async def chat_completions(
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
     # 获取凭证信息（用于 project_id 和 session_id）
-    cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
+    cred_result = await cred_mgr.get_valid_credential(mode="antigravity")
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
@@ -1151,215 +994,84 @@ async def chat_completions(
         generation_config=generation_config,
     )
 
+    # 图像生成模型特殊处理
+    if "-image" in model:
+        request_body = prepare_image_request(request_body, model)
+
     # 生成请求 ID
     request_id = f"chatcmpl-{int(time.time() * 1000)}"
 
     # 发送请求
     try:
-        # =================================================================
-        # 分支 1: 普通模式 (没有 -search 后缀)
-        # =================================================================
-        if not use_search:
-            # [新增] 处理假流式模式 (Fake Streaming)
-            if use_fake_streaming and stream:
-                log.info(f"[ANTIGRAVITY] 使用假流式响应: {model}")
-                return await antigravity_fake_stream_response(
-                    request_body, cred_mgr, model, request_id
-                )
+        if not stream and use_fake_streaming:
+            log.info(f"[ANTIGRAVITY] 开启后端假流式: 请求是非流式，但后端调用流式接口进行聚合")
+            # 分发到流式请求函数 (对应 send_antigravity_request_stream)
+            resources, cred_name, cred_data = await send_antigravity_request_stream(
+                request_body, cred_mgr
+            )
+            
+            # 执行聚合逻辑 (对应 CLI 中的静默消费)
+            response_data = await aggregate_antigravity_stream(resources)
+            
+            # 记录成功
+            if cred_name:
+                await cred_mgr.record_api_call_result(cred_name, True, mode="antigravity")
+            
+            # 转换并返回聚合后的 JSON
+            openai_response = convert_antigravity_response_to_openai(response_data, model, request_id)
+            return JSONResponse(content=openai_response)
 
-            # 标准流式/非流式处理
-            if stream:
+        if stream:
+            # 处理抗截断功能（仅流式传输时有效）
+            if use_anti_truncation:
+                log.info("[ANTIGRAVITY] 启用流式抗截断功能")
+                max_attempts = await get_anti_truncation_max_attempts()
+
+                # 包装请求函数以适配抗截断处理器
                 async def antigravity_request_func(payload):
-                    resources, c_name, c_data = await send_antigravity_request_stream(payload, cred_mgr)
+                    resources, cred_name, cred_data = await send_antigravity_request_stream(
+                        payload, cred_mgr
+                    )
                     response, stream_ctx, client = resources
                     return StreamingResponse(
                         convert_antigravity_stream_to_openai(
-                            # 注意：确保参数顺序与定义一致
-                            response, stream_ctx, client, model, request_id, cred_mgr, c_name
+                            response, stream_ctx, client, model, request_id, cred_mgr, cred_name
                         ),
                         media_type="text/event-stream"
                     )
-                
-                # 如果开启了抗截断，应用抗截断装饰器
-                if use_anti_truncation:
-                    max_attempts = await get_anti_truncation_max_attempts()
-                    return await apply_anti_truncation_to_stream(
-                        antigravity_request_func, request_body, max_attempts
-                    )
-                else:
-                    return await antigravity_request_func(request_body)
-            else:
-                response_data, _, _ = await send_antigravity_request_no_stream(request_body, cred_mgr)
-                return JSONResponse(content=convert_antigravity_response_to_openai(response_data, model, request_id))
 
-        # =================================================================
-        # 分支 2: 搜索模式 (带有 -search 后缀)
-        # 进入服务端 Agent 逻辑：拦截工具调用 -> 执行搜索 -> 喂回结果
-        # =================================================================
-        
-        # 1. 第一次请求：强制非流式，以便检查是否触发搜索
-        response_data, cred_name, cred_data = await send_antigravity_request_no_stream(
-            request_body, cred_mgr
-        )
-        
-        # 2. 检查是否有 search 函数调用
-        candidates = response_data.get("response", {}).get("candidates", [])
-        should_search = False
-        search_query = ""
-        function_call_id = None
-        
-        if candidates:
-            first_part = candidates[0].get("content", {}).get("parts", [])[0]
-            if "functionCall" in first_part and first_part["functionCall"]["name"] == "search":
-                should_search = True
-                search_query = first_part["functionCall"]["args"]["query"]
-                function_call_id = first_part["functionCall"].get("id")
+                return await apply_anti_truncation_to_stream(
+                    antigravity_request_func, request_body, max_attempts
+                )
 
-        # 3. 如果触发了搜索
-        if should_search:
-            log.info(f"[Server Agent] 执行搜索: {search_query}")
-            search_result = "Search failed."
-            
-            # 轮换 Key 重试逻辑
-            for attempt in range(3):
-                api_key, cx_id = await get_google_search_config()
-                if not api_key:
-                    search_result = "Error: Google Search API not configured."
-                    log.error("[Server Agent] 搜索配置缺失")
-                    break
-                    
-                try:
-                    # 使用 http_client 以支持代理
-                    from src.httpx_client import http_client
-                    async with httpx.AsyncClient() as client:
-                        g_res = await client.get(
-                            "https://www.googleapis.com/customsearch/v1",
-                            params={"key": api_key, "cx": cx_id, "q": search_query},
-                            timeout=30.0
-                        )
-                        if g_res.status_code == 200:
-                            items = g_res.json().get("items", [])
-                            if not items:
-                                search_result = "No results found."
-                            else:
-                                snippets = [f"[{i+1}] {item.get('title')}: {item.get('snippet')}" for i, item in enumerate(items[:6])]
-                                search_result = "\n".join(snippets)
-                                log.info(f"[Server Agent] 搜索成功:\n{search_result[:100]}...")
-                            break
-                        else:
-                             if g_res.status_code not in [403, 429]: break
-                except Exception:
-                    continue
+            # 流式请求（无抗截断）
+            resources, cred_name, cred_data = await send_antigravity_request_stream(
+                request_body, cred_mgr
+            )
+            # resources 是一个元组: (response, stream_ctx, client)
+            response, stream_ctx, client = resources
 
-            # 构造第二轮请求
-            contents.append({"role": "model", "parts": [first_part]})
-            
-            func_response = {
-                "name": "search",
-                "response": {"content": search_result}
-            }
-            if function_call_id:
-                func_response["id"] = function_call_id
-
-            contents.append({
-                "role": "user", 
-                "parts": [{
-                    "functionResponse": func_response
-                }, {
-                    "text": "\n\n(System Note: Please answer the user's question based on the search results above.)" 
-                }]
-            })
-            
-            request_body["request"]["contents"] = contents
-            
-            # 强制禁用工具调用
-            request_body["request"]["toolConfig"] = {
-                "functionCallingConfig": {"mode": "NONE"}
-            }
-            
-            # --- 执行最终回答生成 (带重试) ---
-            log.info("[Server Agent] 搜索完成，正在生成最终回答...")
-            final_response = None
-            last_err = None
-            
-            for i in range(3):
-                try:
-                    resp_data, _, _ = await send_antigravity_request_no_stream(request_body, cred_mgr)
-                    candidates = resp_data.get("response", {}).get("candidates", [])
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if any(p.get("text", "").strip() for p in parts):
-                            final_response = resp_data
-                            break
-                    log.warning(f"[Server Agent] 第 {i+1} 次生成内容为空，正在重试...")
-                except Exception as e:
-                    last_err = e
-                    import asyncio
-                    await asyncio.sleep(1)
-
-            if not final_response:
-                raise HTTPException(status_code=500, detail=f"Failed to generate answer: {str(last_err)}")
-
-            # 返回响应
-            if stream:
-                # 手动构造流式响应
-                async def generate_response_stream():
-                    openai_res = convert_antigravity_response_to_openai(final_response, model, request_id)
-                    choice = openai_res["choices"][0]
-                    chunk_data = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": choice["message"]["content"]}, "finish_reason": None}]
-                    }
-                    yield f"data: {json.dumps(chunk_data)}\n\n"
-                    end_chunk = {
-                        "id": request_id, 
-                        "object": "chat.completion.chunk", 
-                        "created": int(time.time()), 
-                        "model": model, 
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
-                        "usage": openai_res.get("usage", {})
-                    }
-                    yield f"data: {json.dumps(end_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                return StreamingResponse(generate_response_stream(), media_type="text/event-stream")
-            else:
-                return JSONResponse(content=convert_antigravity_response_to_openai(final_response, model, request_id))
-
-        # 4. 如果没有触发搜索 (且是搜索模式)
-        # 这意味着模型认为不需要搜索就能回答，我们直接返回第一次的响应
-        if stream:
-            # 同样需要手动构造流式响应
-            async def generate_direct_stream():
-                openai_res = convert_antigravity_response_to_openai(response_data, model, request_id)
-                choice = openai_res["choices"][0]
-                chunk_data = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": choice["message"]["content"]}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(chunk_data)}\n\n"
-                end_chunk = {
-                    "id": request_id, 
-                    "object": "chat.completion.chunk", 
-                    "created": int(time.time()), 
-                    "model": model, 
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
-                    "usage": openai_res.get("usage", {})
-                }
-                yield f"data: {json.dumps(end_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(generate_direct_stream(), media_type="text/event-stream")
+            # 转换并返回流式响应,传递资源管理对象
+            # response 现在是 filtered_lines 生成器
+            return StreamingResponse(
+                convert_antigravity_stream_to_openai(
+                    response, stream_ctx, client, model, request_id, cred_mgr, cred_name
+                ),
+                media_type="text/event-stream"
+            )
         else:
-            return JSONResponse(content=convert_antigravity_response_to_openai(response_data, model, request_id))
+            # 非流式请求
+            response_data, cred_name, cred_data = await send_antigravity_request_no_stream(
+                request_body, cred_mgr
+            )
+
+            # 转换并返回响应
+            openai_response = convert_antigravity_response_to_openai(response_data, model, request_id)
+            return JSONResponse(content=openai_response)
 
     except Exception as e:
         log.error(f"[ANTIGRAVITY] Request failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
 
 
 # ==================== Gemini 格式 API 端点 ====================
@@ -1381,12 +1093,12 @@ async def gemini_list_models(api_key: str = Depends(authenticate_gemini_flexible
             log.warning("[ANTIGRAVITY GEMINI] Failed to fetch models from API, returning empty list")
             return JSONResponse(content={"models": []})
 
-        # 将 OpenAI 格式转换为 Gemini 格式，同时添加变体
+        # 将 OpenAI 格式转换为 Gemini 格式，同时添加抗截断版本
         gemini_models = []
         for model in models:
             model_id = model.get("id", "")
 
-            # 1. 原始模型
+            # 添加原始模型
             gemini_models.append({
                 "name": f"models/{model_id}",
                 "version": "001",
@@ -1395,53 +1107,13 @@ async def gemini_list_models(api_key: str = Depends(authenticate_gemini_flexible
                 "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
             })
 
-            # 2. 搜索版本
-            search_id = f"{model_id}-search"
-            gemini_models.append({
-                "name": f"models/{search_id}",
-                "version": "001",
-                "displayName": search_id,
-                "description": f"Antigravity API - {search_id} (Google Search)",
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-            })
-
-            # 3. 流式抗截断版本
+            # 添加流式抗截断版本
             anti_truncation_id = f"流式抗截断/{model_id}"
             gemini_models.append({
                 "name": f"models/{anti_truncation_id}",
                 "version": "001",
                 "displayName": anti_truncation_id,
                 "description": f"Antigravity API - {anti_truncation_id} (带流式抗截断功能)",
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-            })
-
-            # 4. [新增] 流式抗截断 + 搜索
-            at_search_id = f"流式抗截断/{model_id}-search"
-            gemini_models.append({
-                "name": f"models/{at_search_id}",
-                "version": "001",
-                "displayName": at_search_id,
-                "description": f"Antigravity API - {at_search_id} (抗截断 + 搜索)",
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-            })
-
-            # 5. 假流式版本
-            fake_streaming_id = f"假流式/{model_id}"
-            gemini_models.append({
-                "name": f"models/{fake_streaming_id}",
-                "version": "001",
-                "displayName": fake_streaming_id,
-                "description": f"Antigravity API - {fake_streaming_id} (假流式)",
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-            })
-
-            # 6. [新增] 假流式 + 搜索
-            fs_search_id = f"假流式/{model_id}-search"
-            gemini_models.append({
-                "name": f"models/{fs_search_id}",
-                "version": "001",
-                "displayName": fs_search_id,
-                "description": f"Antigravity API - {fs_search_id} (假流式 + 搜索)",
                 "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
             })
 
@@ -1500,12 +1172,6 @@ async def gemini_generate_content(
     if model.startswith("models/"):
         model = model[7:]
 
-    # === [修改: 处理模型名称后缀] ===
-    enable_search = is_search_model(model)
-    if enable_search:
-        from src.utils import get_base_model_name
-        model = get_base_model_name(model)
-
     # 检测并处理抗截断模式（虽然非流式不会使用，但要处理模型名）
     use_anti_truncation = is_anti_truncation_model(model)
     if use_anti_truncation:
@@ -1545,7 +1211,7 @@ async def gemini_generate_content(
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
     # 获取凭证信息（用于 project_id 和 session_id）
-    cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
+    cred_result = await cred_mgr.get_valid_credential(mode="antigravity")
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
@@ -1565,17 +1231,6 @@ async def gemini_generate_content(
         # Gemini 和 Antigravity 的 tools 格式基本一致
         antigravity_tools = request_data["tools"]
 
-    # === [修改 5: 注入搜索工具] ===
-    if enable_search:
-        if antigravity_tools is None:
-            antigravity_tools = []
-        
-        search_tool = {"googleSearchRetrieval": {}}
-        if antigravity_tools:
-            antigravity_tools[0].update(search_tool)
-        else:
-            antigravity_tools = [search_tool]
-
     # 构建 Antigravity 请求体
     request_body = build_antigravity_request_body(
         contents=contents,
@@ -1586,6 +1241,10 @@ async def gemini_generate_content(
         tools=antigravity_tools,
         generation_config=generation_config,
     )
+
+    # 图像生成模型特殊处理
+    if "-image" in model:
+        request_body = prepare_image_request(request_body, model)
 
     # 发送非流式请求
     try:
@@ -1669,7 +1328,7 @@ async def gemini_stream_generate_content(
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
     # 获取凭证信息（用于 project_id 和 session_id）
-    cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
+    cred_result = await cred_mgr.get_valid_credential(mode="antigravity")
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
@@ -1699,6 +1358,10 @@ async def gemini_stream_generate_content(
         tools=antigravity_tools,
         generation_config=generation_config,
     )
+
+    # 图像生成模型特殊处理
+    if "-image" in model:
+        request_body = prepare_image_request(request_body, model)
 
     # 发送流式请求
     try:
@@ -1892,7 +1555,7 @@ async def sdwebui_txt2img(request: Request, _: str = Depends(authenticate_sdwebu
     generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
 
     # 获取凭证信息
-    cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
+    cred_result = await cred_mgr.get_valid_credential(mode="antigravity")
     if not cred_result:
         log.error("当前无可用 antigravity 凭证")
         raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
@@ -1946,4 +1609,3 @@ async def sdwebui_txt2img(request: Request, _: str = Depends(authenticate_sdwebu
     except Exception as e:
         log.error(f"[ANTIGRAVITY SD-WebUI] txt2img request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
-

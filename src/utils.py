@@ -1,18 +1,19 @@
 import base64
 import platform
-from datetime import datetime, timezone
-from typing import List, Optional
-
+import time
+import httpx
 from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from log import log
+from google import genai
 import os
 import json
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Dict
-import google.generativeai as genai
+from typing import Any, Optional, Dict, List
+
+
 
 # HTTP Bearer security scheme
 security = HTTPBearer()
@@ -81,15 +82,32 @@ def get_all_gemini_models():
     """
     获取所有可用的 Gemini 模型名称。
     """
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    
     available_models = []
-    for m in genai.list_models():
-        # 过滤掉不支持生成内容的模型，或者根据您的需求进行其他过滤
-        if "generateContent" in m.supported_generation_methods:
-            model_name = m.name
-            # 检查并去除 '/models/' 前缀
-            if model_name.startswith('models/'):
-                model_name = model_name.replace('models/', '', 1) # 只替换一次
-            available_models.append(model_name)
+    
+    try:
+        # 初始化新版 Client
+        # 如果 api_key 为 None，它会自动读取环境变量 GOOGLE_API_KEY
+        client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
+        
+        # 新版 SDK 使用 client.models.list() 获取模型列表
+        # 这里的 m 是模型对象，属性与旧版有所不同
+        for m in client.models.list():
+            # 检查模型是否支持生成内容
+            # 新版 SDK 中，supported_actions 包含了模型支持的操作
+            if 'generateContent' in m.supported_actions:
+                model_name = m.name
+                
+                # 处理模型名称格式，统一去掉 'models/' 前缀
+                if model_name.startswith('models/'):
+                    model_name = model_name.replace('models/', '', 1)
+                
+                available_models.append(model_name)
+                
+    except Exception as e:
+        # 如果因为网络、API Key 无效等原因失败，记录日志并返回硬编码的保底列表
+        log.error(f"获取动态模型列表失败 (请检查 GOOGLE_API_KEY): {e}")
     return available_models
     
 # 获取模型列表
@@ -184,7 +202,6 @@ def get_base_model_from_feature_model(model_name: str) -> str:
         if model_name.startswith(prefix):
             return model_name[len(prefix) :]
     return model_name
-
 
 def get_available_models(router_type: str = "openai") -> List[str]:
     """

@@ -98,6 +98,80 @@ async def _handle_auto_ban(
         await credential_manager.set_cred_disabled(credential_name, True)
 
 
+def _clean_tools_for_gemini(tools):
+    """
+    清理工具定义，移除 Gemini API 不支持的 JSON Schema 字段
+    
+    Gemini API 只支持有限的 OpenAPI 3.0 Schema 属性：
+    - 支持: type, description, enum, items, properties, required, nullable, format
+    - 不支持: $schema, $id, $ref, $defs, title, examples, default, readOnly,
+              exclusiveMaximum, exclusiveMinimum, oneOf, anyOf, allOf, const 等
+    
+    参考: github.com/googleapis/python-genai/issues/699, #388, #460, #1122, #264, #4551
+    """
+    if not tools:
+        return tools
+    
+    # Gemini 不支持的字段列表
+    # 注意：title 在某些情况下是必需的，所以不移除
+    UNSUPPORTED_KEYS = {
+        '$schema', '$id', '$ref', '$defs', 'definitions',
+        'example', 'examples', 'readOnly', 'writeOnly', 'default',
+        'exclusiveMaximum', 'exclusiveMinimum',
+        'oneOf', 'anyOf', 'allOf', 'const',
+        'additionalItems', 'contains', 'patternProperties', 'dependencies',
+        'propertyNames', 'if', 'then', 'else',
+        'contentEncoding', 'contentMediaType',
+        'additionalProperties', 'minLength', 'maxLength',
+        'minItems', 'maxItems', 'uniqueItems'
+    }
+    
+    def clean_schema(obj):
+        """递归清理 schema 对象"""
+        if isinstance(obj, dict):
+            cleaned = {}
+            for key, value in obj.items():
+                if key in UNSUPPORTED_KEYS:
+                    continue
+                cleaned[key] = clean_schema(value)
+            # 确保有 type 字段（如果有 properties 但没有 type）
+            if "properties" in cleaned and "type" not in cleaned:
+                cleaned["type"] = "object"
+            return cleaned
+        elif isinstance(obj, list):
+            return [clean_schema(item) for item in obj]
+        else:
+            return obj
+    
+    # 清理每个工具的参数
+    cleaned_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            cleaned_tools.append(tool)
+            continue
+            
+        cleaned_tool = tool.copy()
+        
+        # 清理 functionDeclarations
+        if "functionDeclarations" in cleaned_tool:
+            cleaned_declarations = []
+            for func_decl in cleaned_tool["functionDeclarations"]:
+                if not isinstance(func_decl, dict):
+                    cleaned_declarations.append(func_decl)
+                    continue
+                    
+                cleaned_decl = func_decl.copy()
+                if "parameters" in cleaned_decl:
+                    cleaned_decl["parameters"] = clean_schema(cleaned_decl["parameters"])
+                cleaned_declarations.append(cleaned_decl)
+            
+            cleaned_tool["functionDeclarations"] = cleaned_declarations
+        
+        cleaned_tools.append(cleaned_tool)
+    
+    return cleaned_tools
+
+
 async def _handle_error_with_retry(
     credential_manager: CredentialManager,
     status_code: int,
@@ -109,6 +183,10 @@ async def _handle_error_with_retry(
 ):
     """
     统一处理错误和重试逻辑
+
+    仅在以下情况下进行自动重试:
+    1. 429错误(速率限制)
+    2. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)
 
     返回值：
     - True: 需要继续重试（会在下次循环中自动获取新凭证）
@@ -130,20 +208,15 @@ async def _handle_error_with_retry(
             return True
         return False
 
-    # 如果不触发自动封禁，使用普通重试逻辑
-    if retry_enabled and attempt < max_retries:
-        if status_code == 429:
-            log.warning(
-                f"[RETRY] 429 error encountered, retrying ({attempt + 1}/{max_retries})"
-            )
-        else:
-            log.warning(
-                f"[RETRY] Non-200 error encountered (status {status_code}), retrying ({attempt + 1}/{max_retries})"
-            )
-
+    # 如果不触发自动封禁，仅对429错误进行重试
+    if status_code == 429 and retry_enabled and attempt < max_retries:
+        log.warning(
+            f"[RETRY] 429 error encountered, retrying ({attempt + 1}/{max_retries})"
+        )
         await asyncio.sleep(retry_interval)
         return True
 
+    # 其他错误不进行重试
     return False
 
 
@@ -215,7 +288,7 @@ async def send_gemini_request(
         # 每次请求都获取新的凭证（传递模型组）
         try:
             credential_result = await credential_manager.get_valid_credential(
-                is_antigravity=False, model_key=model_group
+                mode="geminicli", model_key=model_group
             )
             if not credential_result:
                 return _create_error_response("No valid credentials available", 500)
@@ -738,6 +811,10 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
                 thinking_config["thinkingBudget"] = thinking_budget
         if "includeThoughts" not in thinking_config:
             thinking_config["includeThoughts"] = should_include_thoughts(model_from_path)
+
+    # 清理工具定义中不支持的 JSON Schema 字段
+    if "tools" in request_data and request_data["tools"]:
+        request_data["tools"] = _clean_tools_for_gemini(request_data["tools"])
 
     # 为搜索模型添加Google Search工具（如果未指定且没有functionDeclarations）
     if is_search_model(model_from_path):

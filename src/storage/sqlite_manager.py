@@ -16,17 +16,13 @@ from log import log
 class SQLiteManager:
     """SQLite 数据库管理器"""
 
-    # 状态字段常量 (增加统计字段)
+    # 状态字段常量
     STATE_FIELDS = {
         "error_codes",
         "disabled",
         "last_success",
         "user_email",
         "model_cooldowns",
-        # [新增]
-        "daily_usage",
-        "daily_usage_pro",
-        "last_usage_reset",
     }
 
     # 所有必需的列定义（用于自动校验和修复）
@@ -40,11 +36,7 @@ class SQLiteManager:
             ("rotation_order", "INTEGER DEFAULT 0"),
             ("call_count", "INTEGER DEFAULT 0"),
             ("created_at", "REAL DEFAULT (unixepoch())"),
-            ("updated_at", "REAL DEFAULT (unixepoch())"),
-            # [新增]
-            ("daily_usage", "INTEGER DEFAULT 0"),
-            ("daily_usage_pro", "INTEGER DEFAULT 0"),
-            ("last_usage_reset", "REAL DEFAULT 0"),
+            ("updated_at", "REAL DEFAULT (unixepoch())")
         ],
         "antigravity_credentials": [
             ("disabled", "INTEGER DEFAULT 0"),
@@ -55,11 +47,7 @@ class SQLiteManager:
             ("rotation_order", "INTEGER DEFAULT 0"),
             ("call_count", "INTEGER DEFAULT 0"),
             ("created_at", "REAL DEFAULT (unixepoch())"),
-            ("updated_at", "REAL DEFAULT (unixepoch())"),
-            # [新增] 虽然Antigravity目前没用这些，但为了统一性加上
-            ("daily_usage", "INTEGER DEFAULT 0"),
-            ("daily_usage_pro", "INTEGER DEFAULT 0"),
-            ("last_usage_reset", "REAL DEFAULT 0"),
+            ("updated_at", "REAL DEFAULT (unixepoch())")
         ]
     }
 
@@ -96,7 +84,7 @@ class SQLiteManager:
                     await db.execute("PRAGMA journal_mode=WAL")
                     await db.execute("PRAGMA foreign_keys=ON")
 
-                    # 检查并自动修复数据库结构 (这会自动添加新列)
+                    # 检查并自动修复数据库结构
                     await self._ensure_schema_compatibility(db)
 
                     # 创建表
@@ -167,11 +155,6 @@ class SQLiteManager:
                 last_success REAL,
                 user_email TEXT,
 
-                -- 统计字段 [新增]
-                daily_usage INTEGER DEFAULT 0,
-                daily_usage_pro INTEGER DEFAULT 0,
-                last_usage_reset REAL DEFAULT 0,
-
                 -- 模型级 CD 支持 (JSON: {model_key: cooldown_timestamp})
                 model_cooldowns TEXT DEFAULT '{}',
 
@@ -197,11 +180,6 @@ class SQLiteManager:
                 error_codes TEXT DEFAULT '[]',
                 last_success REAL,
                 user_email TEXT,
-
-                -- 统计字段 [新增]
-                daily_usage INTEGER DEFAULT 0,
-                daily_usage_pro INTEGER DEFAULT 0,
-                last_usage_reset REAL DEFAULT 0,
 
                 -- 模型级 CD 支持 (JSON: {model_name: cooldown_timestamp})
                 model_cooldowns TEXT DEFAULT '{}',
@@ -280,26 +258,38 @@ class SQLiteManager:
         if not self._initialized:
             raise RuntimeError("SQLite manager not initialized")
 
-    def _is_antigravity(self, filename: str) -> bool:
-        """判断是否为 antigravity 凭证"""
-        return filename.startswith("ag_")
-
-    def _get_table_name(self, is_antigravity: bool) -> str:
-        """根据 is_antigravity 标志获取对应的表名"""
-        return "antigravity_credentials" if is_antigravity else "credentials"
+    def _get_table_name(self, mode: str) -> str:
+        """根据 mode 获取对应的表名"""
+        if mode == "antigravity":
+            return "antigravity_credentials"
+        elif mode == "geminicli":
+            return "credentials"
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Must be 'geminicli' or 'antigravity'")
 
     # ============ SQL 方法 ============
 
     async def get_next_available_credential(
-        self, is_antigravity: bool = False, model_key: Optional[str] = None
+        self, mode: str = "geminicli", model_key: Optional[str] = None
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
         随机获取一个可用凭证（负载均衡）
+        - 未禁用
+        - 如果提供了 model_key，还会检查模型级冷却
+        - 随机选择
+
+        Args:
+            mode: 凭证模式 ("geminicli" 或 "antigravity")
+            model_key: 模型键（用于模型级冷却检查，antigravity 用模型名，gcli 用 pro/flash）
+
+        Note:
+            - 对于 antigravity: model_key 是具体模型名（如 "gemini-2.0-flash-exp"）
+            - 对于 gcli: model_key 是 "pro" 或 "flash"
         """
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
                 current_time = time.time()
 
@@ -334,12 +324,14 @@ class SQLiteManager:
                     return None
 
         except Exception as e:
-            log.error(f"Error getting next available credential (antigravity={is_antigravity}, model_key={model_key}): {e}")
+            log.error(f"Error getting next available credential (mode={mode}, model_key={model_key}): {e}")
             return None
 
     async def get_available_credentials_list(self) -> List[str]:
         """
         获取所有可用凭证列表
+        - 未禁用
+        - 按轮换顺序排序
         """
         self._ensure_initialized()
 
@@ -360,16 +352,17 @@ class SQLiteManager:
 
     # ============ StorageBackend 协议方法 ============
 
-    async def store_credential(self, filename: str, credential_data: Dict[str, Any], is_antigravity: bool = False) -> bool:
+    async def store_credential(self, filename: str, credential_data: Dict[str, Any], mode: str = "geminicli") -> bool:
         """存储或更新凭证"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
                 # 检查凭证是否存在
                 async with db.execute(f"""
-                    SELECT disabled
+                    SELECT disabled, error_codes, last_success, user_email,
+                           rotation_order, call_count
                     FROM {table_name} WHERE filename = ?
                 """, (filename,)) as cursor:
                     existing = await cursor.fetchone()
@@ -397,19 +390,19 @@ class SQLiteManager:
                     """, (filename, json.dumps(credential_data), next_order, time.time()))
 
                 await db.commit()
-                log.debug(f"Stored credential: {filename} (antigravity={is_antigravity})")
+                log.debug(f"Stored credential: {filename} (mode={mode})")
                 return True
 
         except Exception as e:
             log.error(f"Error storing credential {filename}: {e}")
             return False
 
-    async def get_credential(self, filename: str, is_antigravity: bool = False) -> Optional[Dict[str, Any]]:
+    async def get_credential(self, filename: str, mode: str = "geminicli") -> Optional[Dict[str, Any]]:
         """获取凭证数据，支持basename匹配以兼容旧数据"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
                 # 首先尝试精确匹配
                 async with db.execute(f"""
@@ -425,6 +418,7 @@ class SQLiteManager:
                     WHERE filename LIKE '%' || ? OR filename = ?
                 """, (filename, filename)) as cursor:
                     rows = await cursor.fetchall()
+                    # 优先返回完全匹配的，否则返回basename匹配的第一个
                     for row in rows:
                         return json.loads(row[0])
 
@@ -434,12 +428,12 @@ class SQLiteManager:
             log.error(f"Error getting credential {filename}: {e}")
             return None
 
-    async def list_credentials(self, is_antigravity: bool = False) -> List[str]:
+    async def list_credentials(self, mode: str = "geminicli") -> List[str]:
         """列出所有凭证文件名（包括禁用的）"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
                 async with db.execute(f"""
                     SELECT filename FROM {table_name} ORDER BY rotation_order
@@ -451,12 +445,12 @@ class SQLiteManager:
             log.error(f"Error listing credentials: {e}")
             return []
 
-    async def delete_credential(self, filename: str, is_antigravity: bool = False) -> bool:
-        """删除凭证"""
+    async def delete_credential(self, filename: str, mode: str = "geminicli") -> bool:
+        """删除凭证，支持basename匹配以兼容旧数据"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
                 # 首先尝试精确匹配删除
                 result = await db.execute(f"""
@@ -474,28 +468,27 @@ class SQLiteManager:
                 await db.commit()
 
                 if deleted_count > 0:
-                    log.debug(f"Deleted {deleted_count} credential(s): {filename} (antigravity={is_antigravity})")
+                    log.debug(f"Deleted {deleted_count} credential(s): {filename} (mode={mode})")
                     return True
                 else:
-                    log.warning(f"No credential found to delete: {filename} (antigravity={is_antigravity})")
+                    log.warning(f"No credential found to delete: {filename} (mode={mode})")
                     return False
 
         except Exception as e:
             log.error(f"Error deleting credential {filename}: {e}")
             return False
 
-    async def update_credential_state(self, filename: str, state_updates: Dict[str, Any], is_antigravity: bool = False) -> bool:
-        """更新凭证状态"""
+    async def update_credential_state(self, filename: str, state_updates: Dict[str, Any], mode: str = "geminicli") -> bool:
+        """更新凭证状态，支持basename匹配以兼容旧数据"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             # 构建动态 SQL
             set_clauses = []
             values = []
 
             for key, value in state_updates.items():
-                # 检查是否在允许的字段列表中
                 if key in self.STATE_FIELDS:
                     if key == "error_codes":
                         set_clauses.append(f"{key} = ?")
@@ -538,75 +531,72 @@ class SQLiteManager:
             log.error(f"Error updating credential state {filename}: {e}")
             return False
 
-    async def get_credential_state(self, filename: str, is_antigravity: bool = False) -> Dict[str, Any]:
-        """获取凭证状态"""
+    async def get_credential_state(self, filename: str, mode: str = "geminicli") -> Dict[str, Any]:
+        """获取凭证状态，支持basename匹配以兼容旧数据"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
-            # 添加新的统计字段到查询中
-            query = f"""
-                SELECT disabled, error_codes, last_success, user_email, model_cooldowns,
-                       daily_usage, daily_usage_pro, last_usage_reset
-                FROM {table_name} WHERE filename = ?
-            """
-            
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
-                # 精确匹配
-                async with db.execute(query, (filename,)) as cursor:
+                # 首先尝试精确匹配
+                async with db.execute(f"""
+                    SELECT disabled, error_codes, last_success, user_email, model_cooldowns
+                    FROM {table_name} WHERE filename = ?
+                """, (filename,)) as cursor:
                     row = await cursor.fetchone()
 
-                # 模糊匹配
-                if not row:
-                    async with db.execute(f"""
-                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns,
-                               daily_usage, daily_usage_pro, last_usage_reset
-                        FROM {table_name} WHERE filename LIKE '%' || ?
-                    """, (filename,)) as cursor:
-                        row = await cursor.fetchone()
+                    if row:
+                        error_codes_json = row[1] or '[]'
+                        model_cooldowns_json = row[4] or '{}'
+                        return {
+                            "disabled": bool(row[0]),
+                            "error_codes": json.loads(error_codes_json),
+                            "last_success": row[2] or time.time(),
+                            "user_email": row[3],
+                            "model_cooldowns": json.loads(model_cooldowns_json),
+                        }
 
-                if row:
-                    error_codes_json = row[1] or '[]'
-                    model_cooldowns_json = row[4] or '{}'
-                    return {
-                        "disabled": bool(row[0]),
-                        "error_codes": json.loads(error_codes_json),
-                        "last_success": row[2] or time.time(),
-                        "user_email": row[3],
-                        "model_cooldowns": json.loads(model_cooldowns_json),
-                        # [新增]
-                        "daily_usage": row[5] or 0,
-                        "daily_usage_pro": row[6] or 0,
-                        "last_usage_reset": row[7] or 0,
-                    }
+                # 如果精确匹配失败，尝试basename匹配
+                async with db.execute(f"""
+                    SELECT disabled, error_codes, last_success, user_email, model_cooldowns
+                    FROM {table_name} WHERE filename LIKE '%' || ?
+                """, (filename,)) as cursor:
+                    row = await cursor.fetchone()
 
+                    if row:
+                        error_codes_json = row[1] or '[]'
+                        model_cooldowns_json = row[4] or '{}'
+                        return {
+                            "disabled": bool(row[0]),
+                            "error_codes": json.loads(error_codes_json),
+                            "last_success": row[2] or time.time(),
+                            "user_email": row[3],
+                            "model_cooldowns": json.loads(model_cooldowns_json),
+                        }
+
+                # 返回默认状态
                 return {
                     "disabled": False,
                     "error_codes": [],
                     "last_success": time.time(),
                     "user_email": None,
                     "model_cooldowns": {},
-                    "daily_usage": 0,
-                    "daily_usage_pro": 0,
-                    "last_usage_reset": 0,
                 }
 
         except Exception as e:
             log.error(f"Error getting credential state {filename}: {e}")
             return {}
 
-    async def get_all_credential_states(self, is_antigravity: bool = False) -> Dict[str, Dict[str, Any]]:
+    async def get_all_credential_states(self, mode: str = "geminicli") -> Dict[str, Dict[str, Any]]:
         """获取所有凭证状态"""
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
-                # 增加统计字段查询
                 async with db.execute(f"""
                     SELECT filename, disabled, error_codes, last_success,
-                           user_email, model_cooldowns,
-                           daily_usage, daily_usage_pro, last_usage_reset
+                           user_email, model_cooldowns
                     FROM {table_name}
                 """) as cursor:
                     rows = await cursor.fetchall()
@@ -620,6 +610,7 @@ class SQLiteManager:
                         model_cooldowns_json = row[5] or '{}'
                         model_cooldowns = json.loads(model_cooldowns_json)
 
+                        # 自动过滤掉已过期的模型CD
                         if model_cooldowns:
                             model_cooldowns = {
                                 k: v for k, v in model_cooldowns.items()
@@ -632,10 +623,6 @@ class SQLiteManager:
                             "last_success": row[3] or time.time(),
                             "user_email": row[4],
                             "model_cooldowns": model_cooldowns,
-                            # [新增]
-                            "daily_usage": row[6] or 0,
-                            "daily_usage_pro": row[7] or 0,
-                            "last_usage_reset": row[8] or 0,
                         }
 
                     return states
@@ -649,18 +636,32 @@ class SQLiteManager:
         offset: int = 0,
         limit: Optional[int] = None,
         status_filter: str = "all",
-        is_antigravity: bool = False,
+        mode: str = "geminicli",
         error_code_filter: Optional[str] = None,
         cooldown_filter: Optional[str] = None
     ) -> Dict[str, Any]:
-        """获取凭证摘要信息"""
+        """
+        获取凭证的摘要信息（不包含完整凭证数据）- 支持分页和状态筛选
+
+        Args:
+            offset: 跳过的记录数（默认0）
+            limit: 返回的最大记录数（None表示返回所有）
+            status_filter: 状态筛选（all=全部, enabled=仅启用, disabled=仅禁用）
+            mode: 凭证模式 ("geminicli" 或 "antigravity")
+            error_code_filter: 错误码筛选（格式如"400"或"403"，筛选包含该错误码的凭证）
+            cooldown_filter: 冷却状态筛选（"in_cooldown"=冷却中, "no_cooldown"=未冷却）
+
+        Returns:
+            包含 items（凭证列表）、total（总数）、offset、limit 的字典
+        """
         self._ensure_initialized()
 
         try:
-            table_name = self._get_table_name(is_antigravity)
+            # 根据 mode 选择表名
+            table_name = self._get_table_name(mode)
 
             async with aiosqlite.connect(self._db_path) as db:
-                # 全局统计
+                # 先计算全局统计数据（不受筛选条件影响）
                 global_stats = {"total": 0, "normal": 0, "disabled": 0}
                 async with db.execute(f"""
                     SELECT disabled, COUNT(*) FROM {table_name} GROUP BY disabled
@@ -673,8 +674,10 @@ class SQLiteManager:
                         else:
                             global_stats["normal"] = count
 
-                # WHERE 条件
+                # 构建WHERE子句
                 where_clauses = []
+                count_params = []
+
                 if status_filter == "enabled":
                     where_clauses.append("disabled = 0")
                 elif status_filter == "disabled":
@@ -689,22 +692,23 @@ class SQLiteManager:
                     except ValueError:
                         filter_int = None
 
+                # 构建WHERE子句
                 where_clause = ""
                 if where_clauses:
                     where_clause = "WHERE " + " AND ".join(where_clauses)
 
-                # 查询数据（增加统计字段）
+                # 先获取所有数据（用于冷却筛选，因为需要在Python中判断）
                 all_query = f"""
                     SELECT filename, disabled, error_codes, last_success,
-                           user_email, rotation_order, model_cooldowns,
-                           daily_usage, daily_usage_pro
+                           user_email, rotation_order, model_cooldowns
                     FROM {table_name}
                     {where_clause}
                     ORDER BY rotation_order
                 """
 
-                async with db.execute(all_query) as cursor:
+                async with db.execute(all_query, count_params) as cursor:
                     all_rows = await cursor.fetchall()
+
                     current_time = time.time()
                     all_summaries = []
 
@@ -714,6 +718,7 @@ class SQLiteManager:
                         model_cooldowns_json = row[6] or '{}'
                         model_cooldowns = json.loads(model_cooldowns_json)
 
+                        # 自动过滤掉已过期的模型CD
                         active_cooldowns = {}
                         if model_cooldowns:
                             active_cooldowns = {
@@ -746,20 +751,22 @@ class SQLiteManager:
                             "user_email": row[4],
                             "rotation_order": row[5],
                             "model_cooldowns": active_cooldowns,
-                            # [新增]
-                            "daily_usage": row[7] or 0,
-                            "daily_usage_pro": row[8] or 0,
                         }
 
+                        # 应用冷却筛选
                         if cooldown_filter == "in_cooldown":
+                            # 只保留有冷却的凭证
                             if active_cooldowns:
                                 all_summaries.append(summary)
                         elif cooldown_filter == "no_cooldown":
+                            # 只保留没有冷却的凭证
                             if not active_cooldowns:
                                 all_summaries.append(summary)
                         else:
+                            # 不筛选冷却状态
                             all_summaries.append(summary)
 
+                    # 应用分页
                     total_count = len(all_summaries)
                     if limit is not None:
                         summaries = all_summaries[offset:offset + limit]
@@ -784,9 +791,89 @@ class SQLiteManager:
                 "stats": {"total": 0, "normal": 0, "disabled": 0},
             }
 
-    # ============ 配置管理 ============
-    async def set_config(self, key: str, value: Any) -> bool:
+    async def get_duplicate_credentials_by_email(self, mode: str = "geminicli") -> Dict[str, Any]:
+        """
+        获取按邮箱分组的重复凭证信息（只查询邮箱和文件名，不加载完整凭证数据）
+        用于去重操作
+
+        Args:
+            mode: 凭证模式 ("geminicli" 或 "antigravity")
+
+        Returns:
+            包含 email_groups（邮箱分组）、duplicate_count（重复数量）、no_email_count（无邮箱数量）的字典
+        """
         self._ensure_initialized()
+
+        try:
+            # 根据 mode 选择表名
+            table_name = self._get_table_name(mode)
+
+            async with aiosqlite.connect(self._db_path) as db:
+                # 查询所有凭证的文件名和邮箱（不加载完整凭证数据）
+                query = f"""
+                    SELECT filename, user_email
+                    FROM {table_name}
+                    ORDER BY filename
+                """
+
+                async with db.execute(query) as cursor:
+                    rows = await cursor.fetchall()
+
+                    # 按邮箱分组
+                    email_to_files = {}
+                    no_email_files = []
+
+                    for filename, user_email in rows:
+                        if user_email:
+                            if user_email not in email_to_files:
+                                email_to_files[user_email] = []
+                            email_to_files[user_email].append(filename)
+                        else:
+                            no_email_files.append(filename)
+
+                    # 找出重复的邮箱组
+                    duplicate_groups = []
+                    total_duplicate_count = 0
+
+                    for email, files in email_to_files.items():
+                        if len(files) > 1:
+                            # 保留第一个文件，其他为重复
+                            duplicate_groups.append({
+                                "email": email,
+                                "kept_file": files[0],
+                                "duplicate_files": files[1:],
+                                "duplicate_count": len(files) - 1,
+                            })
+                            total_duplicate_count += len(files) - 1
+
+                    return {
+                        "email_groups": email_to_files,
+                        "duplicate_groups": duplicate_groups,
+                        "duplicate_count": total_duplicate_count,
+                        "no_email_files": no_email_files,
+                        "no_email_count": len(no_email_files),
+                        "unique_email_count": len(email_to_files),
+                        "total_count": len(rows),
+                    }
+
+        except Exception as e:
+            log.error(f"Error getting duplicate credentials by email: {e}")
+            return {
+                "email_groups": {},
+                "duplicate_groups": [],
+                "duplicate_count": 0,
+                "no_email_files": [],
+                "no_email_count": 0,
+                "unique_email_count": 0,
+                "total_count": 0,
+            }
+
+    # ============ 配置管理（内存缓存）============
+
+    async def set_config(self, key: str, value: Any) -> bool:
+        """设置配置（写入数据库 + 更新内存缓存）"""
+        self._ensure_initialized()
+
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute("""
@@ -797,68 +884,105 @@ class SQLiteManager:
                         updated_at = excluded.updated_at
                 """, (key, json.dumps(value)))
                 await db.commit()
+
+            # 更新内存缓存
             self._config_cache[key] = value
             return True
+
         except Exception as e:
             log.error(f"Error setting config {key}: {e}")
             return False
 
     async def reload_config_cache(self):
+        """重新加载配置缓存（在批量修改配置后调用）"""
         self._ensure_initialized()
         self._config_loaded = False
         await self._load_config_cache()
         log.info("Config cache reloaded from database")
 
     async def get_config(self, key: str, default: Any = None) -> Any:
+        """获取配置（从内存缓存）"""
         self._ensure_initialized()
         return self._config_cache.get(key, default)
 
     async def get_all_config(self) -> Dict[str, Any]:
+        """获取所有配置（从内存缓存）"""
         self._ensure_initialized()
         return self._config_cache.copy()
 
     async def delete_config(self, key: str) -> bool:
+        """删除配置"""
         self._ensure_initialized()
+
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute("DELETE FROM config WHERE key = ?", (key,))
                 await db.commit()
+
+            # 从内存缓存移除
             self._config_cache.pop(key, None)
             return True
+
         except Exception as e:
             log.error(f"Error deleting config {key}: {e}")
             return False
 
     # ============ 模型级冷却管理 ============
+
     async def set_model_cooldown(
         self,
         filename: str,
         model_key: str,
         cooldown_until: Optional[float],
-        is_antigravity: bool = False
+        mode: str = "geminicli"
     ) -> bool:
+        """
+        设置特定模型的冷却时间
+
+        Args:
+            filename: 凭证文件名
+            model_key: 模型键（antigravity 用模型名，gcli 用 pro/flash）
+            cooldown_until: 冷却截止时间戳（None 表示清除冷却）
+            mode: 凭证模式 ("geminicli" 或 "antigravity")
+
+        Returns:
+            是否成功
+        """
         self._ensure_initialized()
+
         try:
-            table_name = self._get_table_name(is_antigravity)
+            table_name = self._get_table_name(mode)
             async with aiosqlite.connect(self._db_path) as db:
+                # 获取当前的 model_cooldowns
                 async with db.execute(f"""
                     SELECT model_cooldowns FROM {table_name} WHERE filename = ?
                 """, (filename,)) as cursor:
                     row = await cursor.fetchone()
+
                     if not row:
+                        log.warning(f"Credential {filename} not found")
                         return False
+
                     model_cooldowns = json.loads(row[0] or '{}')
+
+                    # 更新或删除指定模型的冷却时间
                     if cooldown_until is None:
                         model_cooldowns.pop(model_key, None)
                     else:
                         model_cooldowns[model_key] = cooldown_until
+
+                    # 写回数据库
                     await db.execute(f"""
                         UPDATE {table_name}
-                        SET model_cooldowns = ?, updated_at = unixepoch()
+                        SET model_cooldowns = ?,
+                            updated_at = unixepoch()
                         WHERE filename = ?
                     """, (json.dumps(model_cooldowns), filename))
                     await db.commit()
+
+                    log.debug(f"Set model cooldown: {filename}, model_key={model_key}, cooldown_until={cooldown_until}")
                     return True
+
         except Exception as e:
-            log.error(f"Error setting model cooldown: {e}")
+            log.error(f"Error setting model cooldown for {filename}: {e}")
             return False

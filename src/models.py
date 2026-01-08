@@ -230,9 +230,7 @@ class CredentialInfo(BaseModel):
     size: Optional[int] = None
     modified_time: Optional[str] = None
     error: Optional[str] = None
-    # [新增]
-    daily_usage: Optional[int] = 0
-    daily_usage_pro: Optional[int] = 0
+
 
 class LogEntry(BaseModel):
     timestamp: str
@@ -279,18 +277,18 @@ class LoginRequest(BaseModel):
 
 class AuthStartRequest(BaseModel):
     project_id: Optional[str] = None  # 现在是可选的
-    use_antigravity: Optional[bool] = False  # 是否使用antigravity模式
+    mode: Optional[str] = "geminicli"  # 凭证模式: geminicli 或 antigravity
 
 
 class AuthCallbackRequest(BaseModel):
     project_id: Optional[str] = None  # 现在是可选的
-    use_antigravity: Optional[bool] = False  # 是否使用antigravity模式
+    mode: Optional[str] = "geminicli"  # 凭证模式: geminicli 或 antigravity
 
 
 class AuthCallbackUrlRequest(BaseModel):
     callback_url: str  # OAuth回调完整URL
     project_id: Optional[str] = None  # 可选的项目ID
-    use_antigravity: Optional[bool] = False  # 是否使用antigravity模式
+    mode: Optional[str] = "geminicli"  # 凭证模式: geminicli 或 antigravity
 
 
 class CredFileActionRequest(BaseModel):
