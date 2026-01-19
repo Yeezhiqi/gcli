@@ -1,3 +1,11 @@
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from config import get_api_password, get_panel_password
+from fastapi import Depends, HTTPException, Header, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from log import log
+
 import base64
 import platform
 import time
@@ -12,13 +20,6 @@ import json
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Dict, List
-from datetime import datetime, timezone
-from typing import List, Optional
-
-from config import get_api_password, get_panel_password
-from fastapi import Depends, HTTPException, Header, Query, Request, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from log import log
 
 # HTTP Bearer security scheme
 security = HTTPBearer()
@@ -126,6 +127,7 @@ PUBLIC_API_MODELS = [
     "gemini-2.5-flash-image",
     "gemini-2.5-flash-image-preview"
 ]
+
 # ====================== Model Helper Functions ======================
 
 def is_fake_streaming_model(model_name: str) -> bool:
