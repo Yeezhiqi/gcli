@@ -29,14 +29,14 @@ from starlette.websockets import WebSocketState
 import config
 from log import log
 
-from .auth import (
+from src.auth import (
     asyncio_complete_auth_flow,
     complete_auth_flow_from_callback_url,
     create_auth_url,
     get_auth_status,
     verify_password,
 )
-from .credential_manager import CredentialManager
+from src.credential_manager import credential_manager
 from .models import (
     LoginRequest,
     AuthStartRequest,
@@ -46,17 +46,17 @@ from .models import (
     CredFileBatchActionRequest,
     ConfigSaveRequest,
 )
-from .storage_adapter import get_storage_adapter
-from .utils import verify_panel_token, STANDARD_USER_AGENT, ANTIGRAVITY_USER_AGENT
-from .antigravity_api import fetch_quota_info
-from .google_oauth_api import Credentials, fetch_project_id
+from src.storage_adapter import get_storage_adapter
+from src.utils import verify_panel_token, GEMINICLI_USER_AGENT, ANTIGRAVITY_USER_AGENT
+from src.api.antigravity import fetch_quota_info
+from src.google_oauth_api import Credentials, fetch_project_id
 from config import get_code_assist_endpoint, get_antigravity_api_url
 
 # 创建路由器
 router = APIRouter()
 
-# 创建credential manager实例（延迟初始化，在首次使用时自动初始化）
-credential_manager = CredentialManager()
+# 不在模块级创建实例，使用单例工厂按需获取
+# 直接按需从模块工厂获取凭证管理器，避免与 web.py 产生循环导入
 
 # WebSocket连接管理
 
@@ -138,20 +138,6 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-
-
-async def ensure_credential_manager_initialized():
-    """确保credential manager已初始化"""
-    if not credential_manager._initialized:
-        await credential_manager.initialize()
-
-
-async def get_credential_manager():
-    """获取全局凭证管理器实例（已废弃，直接使用模块级的 credential_manager）"""
-    global credential_manager
-    # 确保已初始化（在首次使用时自动初始化）
-    await credential_manager._ensure_initialized()
-    return credential_manager
 
 
 def is_mobile_user_agent(user_agent: str) -> bool:
@@ -403,29 +389,9 @@ def validate_mode(mode: str = "geminicli") -> str:
 def get_env_locked_keys() -> set:
     """获取被环境变量锁定的配置键集合"""
     env_locked_keys = set()
-    env_mappings = {
-        "CODE_ASSIST_ENDPOINT": "code_assist_endpoint",
-        "CREDENTIALS_DIR": "credentials_dir",
-        "PROXY": "proxy",
-        "OAUTH_PROXY_URL": "oauth_proxy_url",
-        "GOOGLEAPIS_PROXY_URL": "googleapis_proxy_url",
-        "RESOURCE_MANAGER_API_URL": "resource_manager_api_url",
-        "SERVICE_USAGE_API_URL": "service_usage_api_url",
-        "AUTO_BAN": "auto_ban_enabled",
-        "RETRY_429_MAX_RETRIES": "retry_429_max_retries",
-        "RETRY_429_ENABLED": "retry_429_enabled",
-        "RETRY_429_INTERVAL": "retry_429_interval",
-        "ANTI_TRUNCATION_MAX_ATTEMPTS": "anti_truncation_max_attempts",
-        "COMPATIBILITY_MODE": "compatibility_mode_enabled",
-        "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
-        "HOST": "host",
-        "PORT": "port",
-        "API_PASSWORD": "api_password",
-        "PANEL_PASSWORD": "panel_password",
-        "PASSWORD": "password",
-    }
 
-    for env_key, config_key in env_mappings.items():
+    # 使用 config.py 中统一维护的映射表
+    for env_key, config_key in config.ENV_MAPPINGS.items():
         if os.getenv(env_key):
             env_locked_keys.add(config_key)
 
@@ -954,13 +920,13 @@ async def deduplicate_credentials_by_email_common(mode: str = "geminicli") -> JS
 # =============================================================================
 
 
-@router.post("/auth/upload")
+@router.post("/creds/upload")
 async def upload_credentials(
     files: List[UploadFile] = File(...),
     token: str = Depends(verify_panel_token),
     mode: str = "geminicli"
 ):
-    """批量上传认证文件"""
+    """批量上传凭证文件"""
     try:
         mode = validate_mode(mode)
         return await upload_credentials_common(files, mode=mode)
@@ -1106,15 +1072,25 @@ async def creds_action(
 
         if action == "enable":
             log.info(f"Web请求: 启用文件 {filename} (mode={mode})")
-            await credential_manager.set_cred_disabled(filename, False, mode=mode)
-            log.info(f"Web请求: 文件 {filename} 已启用 (mode={mode})")
-            return JSONResponse(content={"message": f"已启用凭证文件 {os.path.basename(filename)}"})
+            result = await credential_manager.set_cred_disabled(filename, False, mode=mode)
+            log.info(f"[WebRoute] set_cred_disabled 返回结果: {result}")
+            if result:
+                log.info(f"Web请求: 文件 {filename} 已成功启用 (mode={mode})")
+                return JSONResponse(content={"message": f"已启用凭证文件 {os.path.basename(filename)}"})
+            else:
+                log.error(f"Web请求: 文件 {filename} 启用失败 (mode={mode})")
+                raise HTTPException(status_code=500, detail="启用凭证失败，可能凭证不存在")
 
         elif action == "disable":
             log.info(f"Web请求: 禁用文件 {filename} (mode={mode})")
-            await credential_manager.set_cred_disabled(filename, True, mode=mode)
-            log.info(f"Web请求: 文件 {filename} 已禁用 (mode={mode})")
-            return JSONResponse(content={"message": f"已禁用凭证文件 {os.path.basename(filename)}"})
+            result = await credential_manager.set_cred_disabled(filename, True, mode=mode)
+            log.info(f"[WebRoute] set_cred_disabled 返回结果: {result}")
+            if result:
+                log.info(f"Web请求: 文件 {filename} 已成功禁用 (mode={mode})")
+                return JSONResponse(content={"message": f"已禁用凭证文件 {os.path.basename(filename)}"})
+            else:
+                log.error(f"Web请求: 文件 {filename} 禁用失败 (mode={mode})")
+                raise HTTPException(status_code=500, detail="禁用凭证失败，可能凭证不存在")
 
         elif action == "delete":
             try:
@@ -1372,6 +1348,9 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 思维链返回配置
         current_config["return_thoughts_to_frontend"] = await config.get_return_thoughts_to_frontend()
 
+        # Antigravity流式转非流式配置
+        current_config["antigravity_stream2nostream"] = await config.get_antigravity_stream2nostream()
+
         # 服务器配置
         current_config["host"] = await config.get_server_host()
         current_config["port"] = await config.get_server_port()
@@ -1447,6 +1426,10 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if not isinstance(new_config["return_thoughts_to_frontend"], bool):
                 raise HTTPException(status_code=400, detail="思维链返回开关必须是布尔值")
 
+        if "antigravity_stream2nostream" in new_config:
+            if not isinstance(new_config["antigravity_stream2nostream"], bool):
+                raise HTTPException(status_code=400, detail="Antigravity流式转非流式开关必须是布尔值")
+
         # 验证服务器配置
         if "host" in new_config:
             if not isinstance(new_config["host"], str) or not new_config["host"].strip():
@@ -1514,7 +1497,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
 # =============================================================================
 
 
-@router.post("/auth/logs/clear")
+@router.post("/logs/clear")
 async def clear_logs(token: str = Depends(verify_panel_token)):
     """清空日志文件"""
     try:
@@ -1547,7 +1530,7 @@ async def clear_logs(token: str = Depends(verify_panel_token)):
         raise HTTPException(status_code=500, detail=f"清空日志文件失败: {str(e)}")
 
 
-@router.get("/auth/logs/download")
+@router.get("/logs/download")
 async def download_logs(token: str = Depends(verify_panel_token)):
     """下载日志文件"""
     try:
@@ -1583,9 +1566,29 @@ async def download_logs(token: str = Depends(verify_panel_token)):
         raise HTTPException(status_code=500, detail=f"下载日志文件失败: {str(e)}")
 
 
-@router.websocket("/auth/logs/stream")
+@router.websocket("/logs/stream")
 async def websocket_logs(websocket: WebSocket):
     """WebSocket端点，用于实时日志流"""
+    # WebSocket 认证: 从查询参数获取 token
+    token = websocket.query_params.get("token")
+
+    if not token:
+        await websocket.close(code=403, reason="Missing authentication token")
+        log.warning("WebSocket连接被拒绝: 缺少认证token")
+        return
+
+    # 验证 token
+    try:
+        panel_password = await config.get_panel_password()
+        if token != panel_password:
+            await websocket.close(code=403, reason="Invalid authentication token")
+            log.warning("WebSocket连接被拒绝: token验证失败")
+            return
+    except Exception as e:
+        await websocket.close(code=1011, reason="Authentication error")
+        log.error(f"WebSocket认证过程出错: {e}")
+        return
+
     # 检查连接数限制
     if not await manager.connect(websocket):
         return
@@ -1736,7 +1739,7 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
         user_agent = ANTIGRAVITY_USER_AGENT
     else:
         api_base_url = await get_code_assist_endpoint()
-        user_agent = STANDARD_USER_AGENT
+        user_agent = GEMINICLI_USER_AGENT
 
     # 重新获取project id
     project_id = await fetch_project_id(
@@ -1862,6 +1865,100 @@ async def get_credential_quota(
     except Exception as e:
         log.error(f"获取凭证额度失败 {filename}: {e}")
         raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
+
+
+@router.get("/version/info")
+async def get_version_info(check_update: bool = False):
+    """
+    获取当前版本信息 - 从version.txt读取
+    可选参数 check_update: 是否检查GitHub上的最新版本
+    """
+    try:
+        # 获取项目根目录
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        version_file = os.path.join(project_root, "version.txt")
+
+        # 读取version.txt
+        if not os.path.exists(version_file):
+            return JSONResponse({
+                "success": False,
+                "error": "version.txt文件不存在"
+            })
+
+        version_data = {}
+        with open(version_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    version_data[key] = value
+
+        # 检查必要字段
+        if 'short_hash' not in version_data:
+            return JSONResponse({
+                "success": False,
+                "error": "version.txt格式错误"
+            })
+
+        response_data = {
+            "success": True,
+            "version": version_data.get('short_hash', 'unknown'),
+            "full_hash": version_data.get('full_hash', ''),
+            "message": version_data.get('message', ''),
+            "date": version_data.get('date', '')
+        }
+
+        # 如果需要检查更新
+        if check_update:
+            try:
+                from src.httpx_client import get_async
+
+                # 直接获取GitHub上的version.txt文件
+                github_version_url = "https://raw.githubusercontent.com/su-kaka/gcli2api/refs/heads/master/version.txt"
+
+                # 使用统一的httpx客户端
+                resp = await get_async(github_version_url, timeout=10.0)
+
+                if resp.status_code == 200:
+                    # 解析远程version.txt
+                    remote_version_data = {}
+                    for line in resp.text.strip().split('\n'):
+                        line = line.strip()
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            remote_version_data[key] = value
+
+                    latest_hash = remote_version_data.get('full_hash', '')
+                    latest_short_hash = remote_version_data.get('short_hash', '')
+                    current_hash = version_data.get('full_hash', '')
+
+                    has_update = (current_hash != latest_hash) if current_hash and latest_hash else None
+
+                    response_data['check_update'] = True
+                    response_data['has_update'] = has_update
+                    response_data['latest_version'] = latest_short_hash
+                    response_data['latest_hash'] = latest_hash
+                    response_data['latest_message'] = remote_version_data.get('message', '')
+                    response_data['latest_date'] = remote_version_data.get('date', '')
+                else:
+                    # GitHub获取失败，但不影响基本版本信息
+                    response_data['check_update'] = False
+                    response_data['update_error'] = f"GitHub返回错误: {resp.status_code}"
+
+            except Exception as e:
+                log.debug(f"检查更新失败: {e}")
+                response_data['check_update'] = False
+                response_data['update_error'] = str(e)
+
+        return JSONResponse(response_data)
+
+    except Exception as e:
+        log.error(f"获取版本信息失败: {e}")
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        })
+
 
 
 
